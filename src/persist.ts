@@ -83,6 +83,33 @@ export async function latestTrades(limit = 50): Promise<any[]> {
   }
 }
 
+// Time-based pagination (preferred for chronological ordering). Optional beforeAt ISO cursor.
+export async function pageTradesByTime(opts: { limit?: number; beforeAt?: string | null; address?: string | null }): Promise<{ id: number; address: string; at: string; payload: any }[]> {
+  const limit = Math.max(1, Math.min(500, opts.limit ?? 100));
+  try {
+    const p = await getPool();
+    const clauses: string[] = ["type = 'trade'"]; const params: any[] = []; let idx = 1;
+    if (opts.address) { clauses.push(`address = $${idx++}`); params.push(String(opts.address).toLowerCase()); }
+    if (opts.beforeAt) { clauses.push(`at < $${idx++}`); params.push(opts.beforeAt); }
+    const where = clauses.length ? 'where ' + clauses.join(' and ') : '';
+    const sql = `select id, address, at, payload from hl_events ${where} order by at desc, id desc limit ${limit}`;
+    const { rows } = await p.query(sql, params);
+    return rows as any[];
+  } catch (_e) {
+    return [];
+  }
+}
+
+export async function deleteAllTrades(): Promise<number> {
+  try {
+    const p = await getPool();
+    const { rowCount } = await p.query("delete from hl_events where type = 'trade'");
+    return rowCount ?? 0;
+  } catch (_e) {
+    return 0;
+  }
+}
+
 export async function insertTradeIfNew(address: string, payload: any): Promise<boolean> {
   try {
     const p = await getPool();

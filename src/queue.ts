@@ -24,6 +24,11 @@ export type ChangeEvent =
       priceUsd: number;
       size: number; // absolute
       realizedPnlUsd?: number;
+      startPosition?: number;
+      fee?: number;
+      feeToken?: string;
+      hash?: string;
+      action?: string;
     };
 
 export class EventQueue {
