@@ -9,6 +9,7 @@ export * from './persist';
 export * from './postgres';
 export * from './price';
 export * from './queue';
+export * from './pagination';
 export * from './realtime';
 export * from './types';
 export * from './utils';

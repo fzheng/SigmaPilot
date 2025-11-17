@@ -1,4 +1,4 @@
-import { EventQueue } from '../src/queue';
+import { EventQueue } from '../packages/ts-lib/src/queue';
 
 describe('EventQueue trade extension', () => {
   test('push assigns seq and retains extended fields', () => {
