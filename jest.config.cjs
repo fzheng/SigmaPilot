@@ -4,6 +4,10 @@ module.exports = {
   testEnvironment: 'node',
   roots: ['<rootDir>/tests'],
   moduleFileExtensions: ['ts', 'js', 'json'],
+  moduleNameMapper: {
+    '^@hl/ts-lib$': '<rootDir>/packages/ts-lib/src',
+    '^@hl/ts-lib/(.*)$': '<rootDir>/packages/ts-lib/src/$1',
+  },
   collectCoverage: true,
   collectCoverageFrom: [
     'services/**/*.ts',
