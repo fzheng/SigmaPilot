@@ -140,3 +140,7 @@ data/
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Claude Code files
+CLAUDE.md
+.claude/
