@@ -55,6 +55,15 @@ type LeaderboardRawEntry = {
   maxDrawdown?: number;
   numWins?: number;
   numLosses?: number;
+  // Nested stats object from API (contains accurate maxDrawdown)
+  stats?: {
+    maxDrawdown?: number;
+    totalPnl?: number;
+    openPosCount?: number;
+    closePosCount?: number;
+    avgPosDuration?: number;
+    winRate?: number;
+  };
 };
 
 export type RankedEntry = {
@@ -62,6 +71,8 @@ export type RankedEntry = {
   rank: number;
   score: number;
   weight: number;
+  filtered?: boolean;
+  filterReason?: 'max_drawdown_exceeded' | 'scalping_penalty';
   winRate: number;
   executedOrders: number;
   realizedPnl: number;
@@ -157,13 +168,52 @@ export class LeaderboardService {
 
   async refreshPeriod(period: number) {
     const raw = await this.fetchPeriod(period);
-    const ranked = this.scoreEntries(raw);
-    const tracked = this.enrichCount > 0 ? ranked.slice(0, this.enrichCount) : [];
+    let ranked = this.scoreEntries(raw);
+
+    // Two-phase scoring: first score, then enrich, then re-filter based on API stats
+    // We need to enrich more than selectCount to account for potential filtering
+    const enrichTarget = Math.min(ranked.length, Math.max(this.enrichCount, this.opts.selectCount * 2));
+    const toEnrich = ranked.slice(0, enrichTarget);
+
     let hyperliquidSeries = new Map<string, PortfolioWindowSeries[]>();
-    if (tracked.length) {
-      await this.applyAddressStats(period, tracked);
-      hyperliquidSeries = await this.fetchPortfolioSeriesBatch(period, tracked);
+    if (toEnrich.length) {
+      await this.applyAddressStats(period, toEnrich);
+      hyperliquidSeries = await this.fetchPortfolioSeriesBatch(period, toEnrich);
+
+      // Re-filter based on enriched API stats (maxDrawdown from query-addr-stat)
+      const maxDrawdownLimit = Number(process.env.SCORING_MAX_DRAWDOWN_LIMIT ?? DEFAULT_SCORING_PARAMS.maxDrawdownLimit);
+      const beforeCount = ranked.length;
+
+      ranked = ranked.filter((entry) => {
+        const enrichedMDD = entry.statMaxDrawdown ?? 0;
+        if (enrichedMDD > maxDrawdownLimit) {
+          this.logger.info('filtered_high_mdd_enriched', {
+            address: entry.address,
+            statMaxDrawdown: enrichedMDD,
+          });
+          return false;
+        }
+        return true;
+      });
+
+      const filteredCount = beforeCount - ranked.length;
+      if (filteredCount > 0) {
+        this.logger.info('entries_filtered_by_enriched_mdd', { filteredCount, remaining: ranked.length });
+
+        // Recalculate weights for top selectCount after filtering
+        const topN = ranked.slice(0, this.opts.selectCount);
+        const sumScores = topN.reduce((sum, e) => sum + e.score, 0);
+        for (const entry of ranked) {
+          if (topN.includes(entry) && sumScores > 0) {
+            entry.weight = entry.score / sumScores;
+          } else {
+            entry.weight = 0;
+          }
+        }
+      }
     }
+
+    const tracked = ranked.slice(0, this.enrichCount);
     await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
     await this.publishTopCandidates(period, ranked.slice(0, this.opts.selectCount));
     this.logger.info('leaderboard_updated', { period, count: ranked.length });
@@ -203,7 +253,14 @@ export class LeaderboardService {
       optimalTrades: Number(process.env.SCORING_OPTIMAL_TRADES ?? DEFAULT_SCORING_PARAMS.optimalTrades),
       tradeSigma: Number(process.env.SCORING_TRADE_SIGMA ?? DEFAULT_SCORING_PARAMS.tradeSigma),
       pnlReference: Number(process.env.SCORING_PNL_REFERENCE ?? DEFAULT_SCORING_PARAMS.pnlReference),
+      // Hard filters
+      maxDrawdownLimit: Number(process.env.SCORING_MAX_DRAWDOWN_LIMIT ?? DEFAULT_SCORING_PARAMS.maxDrawdownLimit),
+      scalpingThreshold: Number(process.env.SCORING_SCALPING_THRESHOLD ?? DEFAULT_SCORING_PARAMS.scalpingThreshold),
     };
+
+    // Hard filter thresholds
+    const maxDrawdownLimit = scoringParams.maxDrawdownLimit; // 80%
+    const maxTradesHardLimit = Number(process.env.SCORING_MAX_TRADES_LIMIT ?? 200); // Hard cap on trades
 
     const base = entries
       .map((entry) => {
@@ -212,6 +269,57 @@ export class LeaderboardService {
         const executed = Number(entry.executedOrders ?? 0);
         const pnl = Number(entry.realizedPnl ?? 0);
         const efficiency = executed > 0 ? pnl / executed : pnl;
+
+        // Get API's maxDrawdown from stats object (more accurate than computed from pnlList)
+        const apiMaxDrawdown = entry.stats?.maxDrawdown ?? entry.maxDrawdown ?? 0;
+
+        // HARD FILTER 1: Max drawdown > 80% from API stats
+        if (apiMaxDrawdown > maxDrawdownLimit) {
+          this.logger.info('filtered_high_mdd', { address, apiMaxDrawdown });
+          return {
+            address,
+            score: 0,
+            filtered: true,
+            filterReason: 'max_drawdown_exceeded' as const,
+            winRate,
+            executedOrders: executed,
+            realizedPnl: pnl,
+            efficiency,
+            pnlConsistency: 0,
+            remark: entry.remark ?? null,
+            labels: entry.labels || [],
+            statOpenPositions: null,
+            statClosedPositions: null,
+            statAvgPosDuration: null,
+            statTotalPnl: null,
+            statMaxDrawdown: apiMaxDrawdown,
+            meta: { ...entry, filtered: true, filterReason: 'max_drawdown_exceeded', apiMaxDrawdown },
+          };
+        }
+
+        // HARD FILTER 2: Trades > 200 (scalping hard cap)
+        if (executed > maxTradesHardLimit) {
+          this.logger.info('filtered_scalper', { address, executedOrders: executed });
+          return {
+            address,
+            score: 0,
+            filtered: true,
+            filterReason: 'scalping_penalty' as const,
+            winRate,
+            executedOrders: executed,
+            realizedPnl: pnl,
+            efficiency,
+            pnlConsistency: 0,
+            remark: entry.remark ?? null,
+            labels: entry.labels || [],
+            statOpenPositions: null,
+            statClosedPositions: null,
+            statAvgPosDuration: null,
+            statTotalPnl: null,
+            statMaxDrawdown: apiMaxDrawdown,
+            meta: { ...entry, filtered: true, filterReason: 'scalping_penalty', executedOrders: executed },
+          };
+        }
 
         // Estimate wins/losses from win rate and trade count
         const numTrades = executed;
@@ -230,9 +338,14 @@ export class LeaderboardService {
           pnlList,
         }, scoringParams);
 
+        // Use the higher of API's maxDrawdown or computed maxDrawdown
+        const effectiveMaxDrawdown = Math.max(apiMaxDrawdown, scoringResult.details.maxDrawdown);
+
         return {
           address,
           score: scoringResult.score,
+          filtered: scoringResult.filtered,
+          filterReason: scoringResult.filterReason,
           winRate,
           executedOrders: executed,
           realizedPnl: pnl,
@@ -244,20 +357,42 @@ export class LeaderboardService {
           statClosedPositions: null,
           statAvgPosDuration: null,
           statTotalPnl: null,
-          statMaxDrawdown: null,
+          statMaxDrawdown: effectiveMaxDrawdown, // Use effective max drawdown
           meta: {
             ...entry,
-            scoringDetails: scoringResult.details,
+            scoringDetails: { ...scoringResult.details, maxDrawdown: effectiveMaxDrawdown },
             numWins,
             numLosses,
+            filtered: scoringResult.filtered,
+            filterReason: scoringResult.filterReason,
+            apiMaxDrawdown,
           },
         };
       })
-      .filter((entry) => Number.isFinite(entry.score));
+      .filter((entry) => Number.isFinite(entry.score) || entry.filtered);
 
-    // Filter out suspicious 100% win rates with many trades (already penalized in scoring, but extra filter)
-    let scored = base.filter((entry) => entry.winRate < 0.999 || entry.executedOrders < 10);
-    if (!scored.length) scored = base;
+    // Filter out accounts that failed hard filters (MDD > 80% or scalping)
+    let scored = base.filter((entry) => !entry.filtered);
+
+    // Also filter out suspicious 100% win rates with many trades (already penalized in scoring, but extra filter)
+    scored = scored.filter((entry) => entry.winRate < 0.999 || entry.executedOrders < 10);
+
+    // Log filtering stats
+    const filteredCount = base.filter(e => e.filtered).length;
+    if (filteredCount > 0) {
+      this.logger.info('entries_filtered', {
+        total: base.length,
+        filtered: filteredCount,
+        mddFiltered: base.filter(e => e.filterReason === 'max_drawdown_exceeded').length,
+        scalpingFiltered: base.filter(e => e.filterReason === 'scalping_penalty').length,
+      });
+    }
+
+    // Fallback to unfiltered list if everything got filtered
+    if (!scored.length) {
+      this.logger.warn('all_entries_filtered', { total: base.length, filteredCount });
+      scored = base;
+    }
 
     // Sort by score descending
     scored.sort((a, b) => b.score - a.score);

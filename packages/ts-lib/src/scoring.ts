@@ -56,6 +56,18 @@ export interface ScoringParams {
    * Default: 100000
    */
   pnlReference: number;
+
+  /**
+   * Maximum allowed drawdown (0-1). Accounts exceeding this are filtered out.
+   * Default: 0.80 (80%)
+   */
+  maxDrawdownLimit: number;
+
+  /**
+   * Trade count threshold above which scalping penalties apply.
+   * Default: 100
+   */
+  scalpingThreshold: number;
 }
 
 /**
@@ -69,6 +81,8 @@ export const DEFAULT_SCORING_PARAMS: ScoringParams = {
   optimalTrades: 100,
   tradeSigma: 150,
   pnlReference: 100000,
+  maxDrawdownLimit: 0.80,    // 80% max drawdown - hard filter
+  scalpingThreshold: 100,    // trades/month above this get penalized
 };
 
 /**
@@ -107,10 +121,19 @@ export interface ScoringResult {
   /** Final composite performance score (higher = better) */
   score: number;
 
+  /** Whether account was filtered out (MDD > limit or scalping) */
+  filtered: boolean;
+
+  /** Reason for filtering if applicable */
+  filterReason?: 'max_drawdown_exceeded' | 'scalping_penalty';
+
   /** Intermediate calculation values for debugging/display */
   details: {
     /** Smooth PnL score [0, 1] */
     smoothPnlScore: number;
+
+    /** Maximum drawdown from PnL series [0, 1] */
+    maxDrawdown: number;
 
     /** Raw win rate before adjustments */
     rawWinRate: number;
@@ -135,6 +158,20 @@ export interface ScoringResult {
 }
 
 /**
+ * Result of smooth PnL calculation including drawdown metrics
+ */
+export interface SmoothPnlResult {
+  /** Smooth PnL score [0, ~0.5] */
+  score: number;
+  /** Maximum drawdown [0, 1] */
+  maxDrawdown: number;
+  /** Ulcer index (RMS of drawdowns) */
+  ulcerIndex: number;
+  /** Fraction of up moves [0, 1] */
+  upFraction: number;
+}
+
+/**
  * Computes the Smooth PnL Score from a PnL time series.
  *
  * The metric rewards:
@@ -143,9 +180,9 @@ export interface ScoringResult {
  * - Smaller & shorter drawdowns
  *
  * @param pnlList - Array of PnL points in time order
- * @returns Non-negative float [0, ~0.5] (higher = better)
+ * @returns Object with score, maxDrawdown, ulcerIndex, and upFraction
  */
-export function computeSmoothPnlScore(pnlList: PnlPoint[]): number {
+export function computeSmoothPnlScore(pnlList: PnlPoint[]): SmoothPnlResult {
   // Extract numeric PnL values in time order
   const values: number[] = [];
 
@@ -171,7 +208,7 @@ export function computeSmoothPnlScore(pnlList: PnlPoint[]): number {
 
   // Not enough data -> no meaningful score
   if (values.length < 2) {
-    return 0;
+    return { score: 0, maxDrawdown: 0, ulcerIndex: 0, upFraction: 0 };
   }
 
   // Normalize series to start at 0 (focus on shape & change)
@@ -225,7 +262,12 @@ export function computeSmoothPnlScore(pnlList: PnlPoint[]): number {
   // Denominator includes 1 to keep it stable even with tiny drawdowns
   const score = (Math.max(0, R) * upFrac) / (1 + mdd + ulcer);
 
-  return Number.isFinite(score) ? score : 0;
+  return {
+    score: Number.isFinite(score) ? score : 0,
+    maxDrawdown: mdd,
+    ulcerIndex: ulcer,
+    upFraction: upFrac,
+  };
 }
 
 /**
@@ -274,18 +316,26 @@ export function computeNormalizedPnl(realizedPnl: number, reference: number): nu
 }
 
 /**
- * Computes trade frequency score.
- * Prefers moderate activity - not too few (unreliable) or too many (overtrading).
+ * Computes trade frequency score with severe scalping penalties.
+ * Prefers moderate activity - not too few (unreliable) or too many (overtrading/scalping).
+ *
+ * Penalty structure for trades > threshold (default 100/month):
+ * - 100-150: mild penalty (0.7x)
+ * - 150-200: moderate penalty (0.4x)
+ * - 200-300: severe penalty (0.2x)
+ * - 300+: extreme penalty (0.05x) - essentially filtered out
  *
  * @param numTrades - Number of trades
  * @param optimal - Optimal number of trades
  * @param sigma - Spread for preference decay
- * @returns Score [0, 1] centered around optimal
+ * @param scalpingThreshold - Threshold above which scalping penalties apply (default: 100)
+ * @returns Score [0, 1] centered around optimal, with scalping penalties
  */
 export function computeTradeFreqScore(
   numTrades: number,
   optimal: number,
-  sigma: number
+  sigma: number,
+  scalpingThreshold: number = 100
 ): number {
   if (numTrades <= 0) {
     return 0;
@@ -293,11 +343,25 @@ export function computeTradeFreqScore(
 
   // Gaussian-like decay from optimal
   const diff = numTrades - optimal;
-  const score = Math.exp(-(diff * diff) / (2 * sigma * sigma));
+  let score = Math.exp(-(diff * diff) / (2 * sigma * sigma));
 
-  // Bonus reduction for too many trades (overtrading)
-  if (numTrades > optimal * 3) {
-    return score * 0.5;
+  // Progressive scalping penalties for trades > threshold
+  if (numTrades > scalpingThreshold) {
+    const excess = numTrades - scalpingThreshold;
+
+    if (excess <= 50) {
+      // 100-150 trades: mild penalty (0.7x)
+      score *= 0.7;
+    } else if (excess <= 100) {
+      // 150-200 trades: moderate penalty (0.4x)
+      score *= 0.4;
+    } else if (excess <= 200) {
+      // 200-300 trades: severe penalty (0.2x)
+      score *= 0.2;
+    } else {
+      // 300+ trades: extreme penalty (0.05x) - essentially filtered out
+      score *= 0.05;
+    }
   }
 
   return score;
@@ -312,9 +376,13 @@ export function computeTradeFreqScore(
  *       + pnlWeight * normalizedPnl
  *       + tradeFreqWeight * tradeFreqScore
  *
+ * Hard filters:
+ * - Max drawdown > 80%: filtered out (score = 0)
+ * - Scalping penalty: progressive reduction for trades > 100/month
+ *
  * @param stats - Account statistics for the period
  * @param params - Scoring hyperparameters (optional, uses defaults)
- * @returns Scoring result with final score and intermediate details
+ * @returns Scoring result with final score, filter status, and intermediate details
  */
 export function computePerformanceScore(
   stats: AccountStats,
@@ -333,10 +401,18 @@ export function computePerformanceScore(
     return createZeroResult();
   }
 
-  // 1. Compute smooth PnL score from time series
-  const smoothPnlScore = pnlList && pnlList.length >= 2
+  // 1. Compute smooth PnL score from time series (includes maxDrawdown)
+  const smoothPnlResult = pnlList && pnlList.length >= 2
     ? computeSmoothPnlScore(pnlList)
-    : 0;
+    : { score: 0, maxDrawdown: 0, ulcerIndex: 0, upFraction: 0 };
+
+  const smoothPnlScore = smoothPnlResult.score;
+  const maxDrawdown = smoothPnlResult.maxDrawdown;
+
+  // HARD FILTER: Max drawdown > 80% - account is filtered out
+  if (maxDrawdown > params.maxDrawdownLimit) {
+    return createFilteredResult(maxDrawdown, 'max_drawdown_exceeded');
+  }
 
   // 2. Compute adjusted win rate
   const rawWinRate = numWins + numLosses > 0
@@ -350,11 +426,12 @@ export function computePerformanceScore(
     params.pnlReference
   );
 
-  // 4. Compute trade frequency score
+  // 4. Compute trade frequency score (with scalping penalties built in)
   const tradeFreqScore = computeTradeFreqScore(
     numTrades,
     params.optimalTrades,
-    params.tradeSigma
+    params.tradeSigma,
+    params.scalpingThreshold
   );
 
   // 5. Compute weighted components
@@ -368,8 +445,10 @@ export function computePerformanceScore(
 
   return {
     score: Number.isFinite(score) ? score : 0,
+    filtered: false,
     details: {
       smoothPnlScore,
+      maxDrawdown,
       rawWinRate,
       adjWinRate,
       normalizedPnl,
@@ -390,8 +469,38 @@ export function computePerformanceScore(
 function createZeroResult(): ScoringResult {
   return {
     score: 0,
+    filtered: false,
     details: {
       smoothPnlScore: 0,
+      maxDrawdown: 0,
+      rawWinRate: 0,
+      adjWinRate: 0,
+      normalizedPnl: 0,
+      tradeFreqScore: 0,
+      weightedComponents: {
+        smoothPnl: 0,
+        winRate: 0,
+        pnl: 0,
+        tradeFreq: 0,
+      },
+    },
+  };
+}
+
+/**
+ * Creates a filtered result for accounts that fail hard filters
+ */
+function createFilteredResult(
+  maxDrawdown: number,
+  reason: 'max_drawdown_exceeded' | 'scalping_penalty'
+): ScoringResult {
+  return {
+    score: 0,
+    filtered: true,
+    filterReason: reason,
+    details: {
+      smoothPnlScore: 0,
+      maxDrawdown,
       rawWinRate: 0,
       adjWinRate: 0,
       normalizedPnl: 0,
@@ -428,22 +537,27 @@ export interface RankedAccount {
   stats: AccountStats;
   details: ScoringResult['details'];
   isCustom: boolean;
+  filtered: boolean;
+  filterReason?: 'max_drawdown_exceeded' | 'scalping_penalty';
   meta?: Record<string, unknown>;
 }
 
 /**
  * Computes scores for multiple accounts and returns them sorted by score descending.
+ * Filtered accounts (MDD > 80%) are excluded from ranking but can be tracked separately.
  *
  * @param accounts - Array of accounts with their statistics
  * @param params - Scoring hyperparameters (optional)
+ * @param includeFiltered - If true, include filtered accounts at the end with rank 0 (default: false)
  * @returns Array of ranked accounts sorted by score (highest first)
  */
 export function rankAccounts(
   accounts: RankableAccount[],
-  params: ScoringParams = DEFAULT_SCORING_PARAMS
+  params: ScoringParams = DEFAULT_SCORING_PARAMS,
+  includeFiltered: boolean = false
 ): RankedAccount[] {
   // Compute scores for all accounts
-  const scored = accounts.map((account) => {
+  const allScored = accounts.map((account) => {
     const result = computePerformanceScore(account.stats, params);
     return {
       address: account.address,
@@ -451,23 +565,41 @@ export function rankAccounts(
       stats: account.stats,
       details: result.details,
       isCustom: account.isCustom ?? false,
+      filtered: result.filtered,
+      filterReason: result.filterReason,
       meta: account.meta,
     };
   });
 
-  // Sort by score descending
-  scored.sort((a, b) => b.score - a.score);
+  // Separate filtered and valid accounts
+  const validAccounts = allScored.filter((a) => !a.filtered);
+  const filteredAccounts = allScored.filter((a) => a.filtered);
 
-  // Assign ranks (1-based)
-  return scored.map((account, index) => ({
+  // Sort valid accounts by score descending
+  validAccounts.sort((a, b) => b.score - a.score);
+
+  // Assign ranks (1-based) to valid accounts only
+  const ranked = validAccounts.map((account, index) => ({
     ...account,
     rank: index + 1,
   }));
+
+  // Optionally append filtered accounts with rank 0
+  if (includeFiltered && filteredAccounts.length > 0) {
+    const unrankedFiltered = filteredAccounts.map((account) => ({
+      ...account,
+      rank: 0, // Filtered accounts have no rank
+    }));
+    return [...ranked, ...unrankedFiltered];
+  }
+
+  return ranked;
 }
 
 /**
  * Selects top N system accounts and merges with custom accounts.
  * Custom accounts are always included and ranked together with system accounts.
+ * Filtered accounts (MDD > 80%) are excluded from selection.
  *
  * @param systemAccounts - Array of system-selected accounts
  * @param customAccounts - Array of user-added custom accounts (max 3)
@@ -488,21 +620,26 @@ export function selectAndRankAccounts(
       ...account,
       score: result.score,
       details: result.details,
+      filtered: result.filtered,
+      filterReason: result.filterReason,
       isCustom: false,
     };
   });
 
-  // Sort system accounts and take top N
-  scoredSystem.sort((a, b) => b.score - a.score);
-  const topSystem = scoredSystem.slice(0, topN);
+  // Filter out accounts that failed hard filters, then sort and take top N
+  const validSystem = scoredSystem.filter((a) => !a.filtered);
+  validSystem.sort((a, b) => b.score - a.score);
+  const topSystem = validSystem.slice(0, topN);
 
-  // Score custom accounts
+  // Score custom accounts (custom accounts are always included but may be flagged)
   const scoredCustom = customAccounts.slice(0, 3).map((account) => {
     const result = computePerformanceScore(account.stats, params);
     return {
       ...account,
       score: result.score,
       details: result.details,
+      filtered: result.filtered,
+      filterReason: result.filterReason,
       isCustom: true,
     };
   });
@@ -527,6 +664,8 @@ export function selectAndRankAccounts(
     stats: account.stats,
     details: account.details,
     isCustom: account.isCustom,
+    filtered: account.filtered,
+    filterReason: account.filterReason,
     meta: account.meta,
   }));
 }
