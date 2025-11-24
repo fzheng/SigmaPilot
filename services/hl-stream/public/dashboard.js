@@ -118,14 +118,13 @@ function fmtScore(score) {
 function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   const rows = (stats || []).slice(0, TOP_TABLE_LIMIT);
   if (!rows.length) {
-    addressTable.innerHTML = `<tr><td colspan="7">${placeholder('No live leaderboard data')}</td></tr>`;
+    addressTable.innerHTML = `<tr><td colspan="6">${placeholder('No live leaderboard data')}</td></tr>`;
     return;
   }
   addressTable.innerHTML = rows
     .map((row) => {
       const txCount = profiles[row.address]?.txCount || 0;
       const winRateCell = typeof row.winRate === 'number' ? fmtPercent(row.winRate) : placeholder();
-      const drawdownCell = typeof row.statMaxDrawdown === 'number' ? fmtPercent(row.statMaxDrawdown) : placeholder();
       const tradesValue =
         typeof row.statClosedPositions === 'number'
           ? row.statClosedPositions
@@ -153,7 +152,6 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
             ${row.remark ? `<div class="addr-remark">${row.remark}</div>` : ''}
           </td>
           <td data-label="Win Rate">${winRateCell}</td>
-          <td data-label="Max Drawdown">${drawdownCell}</td>
           <td data-label="Trades">${tradesCell}</td>
           <td data-label="Holdings" class="holds-cell">
             ${holdingCell}
