@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any
 from collections import OrderedDict
 
+import asyncpg
 import nats
 from fastapi import FastAPI, HTTPException, Query
 from prometheus_client import Counter, Histogram, generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
@@ -13,6 +14,7 @@ from contracts.py.models import CandidateEvent, ScoreEvent, FillEvent
 SERVICE_NAME = "hl-sage"
 OWNER_TOKEN = os.getenv("OWNER_TOKEN", "dev-owner")
 NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@localhost:5432/hlbot")
 MAX_TRACKED_ADDRESSES = int(os.getenv("MAX_TRACKED_ADDRESSES", "1000"))
 MAX_SCORES = int(os.getenv("MAX_SCORES", "500"))
 STALE_THRESHOLD_HOURS = int(os.getenv("STALE_THRESHOLD_HOURS", "24"))
@@ -40,6 +42,61 @@ async def ensure_stream(js, name: str, subjects: List[str]) -> None:
         await js.stream_info(name)
     except Exception:
         await js.add_stream(name=name, subjects=subjects)
+
+
+async def persist_tracked_address(address: str, state: Dict[str, Any]) -> None:
+    """Persist tracked address state to database for recovery."""
+    try:
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sage_tracked_addresses (address, weight, rank, period, position, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (address) DO UPDATE SET
+                    weight = EXCLUDED.weight,
+                    rank = EXCLUDED.rank,
+                    period = EXCLUDED.period,
+                    position = EXCLUDED.position,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                address,
+                state["weight"],
+                state["rank"],
+                state["period"],
+                state["position"],
+                state["updated"],
+            )
+    except Exception as e:
+        print(f"[hl-sage] Failed to persist tracked address {address}: {e}")
+
+
+async def restore_tracked_addresses() -> int:
+    """Restore tracked addresses from database on startup."""
+    try:
+        async with app.state.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT address, weight, rank, period, position, updated_at
+                FROM sage_tracked_addresses
+                WHERE updated_at > NOW() - INTERVAL '24 hours'
+                ORDER BY updated_at DESC
+                LIMIT $1
+                """,
+                MAX_TRACKED_ADDRESSES,
+            )
+            for row in rows:
+                addr = row["address"].lower()
+                tracked_addresses[addr] = {
+                    "weight": float(row["weight"]),
+                    "rank": int(row["rank"]),
+                    "period": int(row["period"]),
+                    "position": float(row["position"]),
+                    "updated": row["updated_at"],
+                }
+            return len(rows)
+    except Exception as e:
+        print(f"[hl-sage] Failed to restore tracked addresses: {e}")
+        return 0
 
 
 def evict_stale_entries():
@@ -78,13 +135,17 @@ async def handle_candidate(msg):
         if addr_lower in tracked_addresses:
             tracked_addresses.move_to_end(addr_lower)
 
-        tracked_addresses[addr_lower] = {
+        state = {
             "weight": weight,
             "rank": rank,
             "period": period,
             "position": 0.0,
             "updated": datetime.utcnow(),
         }
+        tracked_addresses[addr_lower] = state
+
+        # Persist to database for recovery
+        await persist_tracked_address(addr_lower, state)
 
         evict_stale_entries()
 
@@ -104,6 +165,10 @@ async def handle_fill(msg):
     delta = side_multiplier * float(data.size or 0)
     state["position"] = state.get("position", 0.0) + delta
     state["updated"] = datetime.utcnow()
+
+    # Persist updated position to database
+    await persist_tracked_address(addr_lower, state)
+
     base_score = max(-1.0, min(1.0, state["weight"] * side_multiplier))
     event = ScoreEvent(
         address=data.address,
@@ -135,6 +200,14 @@ async def handle_fill(msg):
 @app.on_event("startup")
 async def startup_event():
     try:
+        # Connect to database first
+        app.state.db = await asyncpg.create_pool(DB_URL)
+
+        # Restore tracked addresses from database
+        restored = await restore_tracked_addresses()
+        print(f"[hl-sage] Restored {restored} tracked addresses from database")
+
+        # Connect to NATS
         app.state.nc = await nats.connect(NATS_URL)
         app.state.js = app.state.nc.jetstream()
         await ensure_stream(app.state.js, "HL_B", ["b.scores.v1"])
@@ -149,11 +222,13 @@ async def startup_event():
 async def shutdown_event():
     if hasattr(app.state, "nc"):
         await app.state.nc.drain()
+    if hasattr(app.state, "db"):
+        await app.state.db.close()
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "scores": len(scores)}
+    return {"status": "ok", "scores": len(scores), "tracked_addresses": len(tracked_addresses)}
 
 
 @app.get("/metrics")

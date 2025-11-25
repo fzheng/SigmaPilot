@@ -183,6 +183,127 @@ async def schedule_close(ticket_id: str, signal: SignalEvent):
         pending_outcomes.pop(ticket_id, None)
 
 
+async def persist_score(address: str, score: ScoreEvent) -> None:
+    """Persist score to database for recovery."""
+    try:
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO decide_scores (address, score, weight, rank, window_s, ts, meta, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                ON CONFLICT (address) DO UPDATE SET
+                    score = EXCLUDED.score,
+                    weight = EXCLUDED.weight,
+                    rank = EXCLUDED.rank,
+                    window_s = EXCLUDED.window_s,
+                    ts = EXCLUDED.ts,
+                    meta = EXCLUDED.meta,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                address.lower(),
+                score.score,
+                score.weight,
+                score.rank,
+                score.window_s,
+                score.ts,
+                json.dumps(score.meta) if isinstance(score.meta, dict) else "{}",
+            )
+    except Exception as e:
+        print(f"[hl-decide] Failed to persist score for {address}: {e}")
+
+
+async def persist_fill(address: str, fill: FillEvent) -> None:
+    """Persist fill to database for recovery."""
+    try:
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO decide_fills (address, fill_id, asset, side, size, price, ts, meta, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                ON CONFLICT (address) DO UPDATE SET
+                    fill_id = EXCLUDED.fill_id,
+                    asset = EXCLUDED.asset,
+                    side = EXCLUDED.side,
+                    size = EXCLUDED.size,
+                    price = EXCLUDED.price,
+                    ts = EXCLUDED.ts,
+                    meta = EXCLUDED.meta,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                address.lower(),
+                fill.fill_id,
+                fill.asset,
+                fill.side,
+                fill.size,
+                fill.price if hasattr(fill, 'price') else None,
+                fill.ts,
+                json.dumps(fill.meta) if isinstance(fill.meta, dict) else "{}",
+            )
+    except Exception as e:
+        print(f"[hl-decide] Failed to persist fill for {address}: {e}")
+
+
+async def restore_state() -> tuple[int, int]:
+    """Restore scores and fills from database on startup."""
+    score_count = 0
+    fill_count = 0
+    try:
+        async with app.state.db.acquire() as conn:
+            # Restore scores
+            score_rows = await conn.fetch(
+                """
+                SELECT address, score, weight, rank, window_s, ts, meta
+                FROM decide_scores
+                WHERE updated_at > NOW() - INTERVAL '24 hours'
+                ORDER BY updated_at DESC
+                LIMIT $1
+                """,
+                MAX_SCORES,
+            )
+            for row in score_rows:
+                score = ScoreEvent(
+                    address=row["address"],
+                    score=float(row["score"]),
+                    weight=float(row["weight"]),
+                    rank=int(row["rank"]),
+                    window_s=int(row["window_s"]),
+                    ts=row["ts"],
+                    meta=json.loads(row["meta"]) if row["meta"] else {},
+                )
+                scores[row["address"]] = score
+                score_count += 1
+
+            # Restore fills
+            fill_rows = await conn.fetch(
+                """
+                SELECT address, fill_id, asset, side, size, price, ts, meta
+                FROM decide_fills
+                WHERE updated_at > NOW() - INTERVAL '24 hours'
+                ORDER BY updated_at DESC
+                LIMIT $1
+                """,
+                MAX_FILLS,
+            )
+            for row in fill_rows:
+                fill = FillEvent(
+                    fill_id=row["fill_id"],
+                    address=row["address"],
+                    asset=row["asset"],
+                    side=row["side"],
+                    size=float(row["size"]),
+                    price=float(row["price"]) if row["price"] is not None else 0.0,
+                    ts=row["ts"],
+                    meta=json.loads(row["meta"]) if row["meta"] else {},
+                )
+                fills[row["address"]] = fill
+                fill_count += 1
+
+    except Exception as e:
+        print(f"[hl-decide] Failed to restore state: {e}")
+
+    return score_count, fill_count
+
+
 def enforce_limits():
     """Enforce memory limits on scores and fills using LRU eviction."""
     while len(scores) > MAX_SCORES:
@@ -197,6 +318,10 @@ async def handle_score(msg):
     if data.address in scores:
         scores.move_to_end(data.address)
     scores[data.address] = data
+
+    # Persist to database
+    await persist_score(data.address, data)
+
     enforce_limits()
     await emit_signal(data.address)
 
@@ -207,6 +332,10 @@ async def handle_fill(msg):
     if data.address in fills:
         fills.move_to_end(data.address)
     fills[data.address] = data
+
+    # Persist to database
+    await persist_fill(data.address, data)
+
     enforce_limits()
     await emit_signal(data.address)
 
@@ -214,7 +343,14 @@ async def handle_fill(msg):
 @app.on_event("startup")
 async def startup():
     try:
+        # Connect to database first
         app.state.db = await asyncpg.create_pool(DB_URL)
+
+        # Restore state from database
+        score_count, fill_count = await restore_state()
+        print(f"[hl-decide] Restored {score_count} scores and {fill_count} fills from database")
+
+        # Connect to NATS
         app.state.nc = await nats.connect(NATS_URL)
         app.state.js = app.state.nc.jetstream()
         await ensure_stream(app.state.js, "HL_D", ["d.signals.v1", "d.outcomes.v1"])
