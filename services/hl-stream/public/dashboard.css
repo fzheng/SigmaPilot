@@ -2,16 +2,71 @@
   box-sizing: border-box;
 }
 
+:root {
+  /* Dark theme (default) */
+  --bg-primary: #0f172a;
+  --bg-secondary: #020617;
+  --bg-card: rgba(15, 23, 42, 0.9);
+  --bg-card-hover: rgba(15, 23, 42, 1);
+  --bg-input: rgba(15, 23, 42, 0.8);
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --text-placeholder: #64748b;
+  --border-primary: rgba(148, 163, 184, 0.15);
+  --border-secondary: rgba(148, 163, 184, 0.2);
+  --border-hover: rgba(148, 163, 184, 0.25);
+  --border-input: rgba(148, 163, 184, 0.2);
+  --accent-primary: #6366f1;
+  --accent-hover: #818cf8;
+  --accent-text: #a5b4fc;
+  --positive: #10b981;
+  --positive-bg: rgba(34, 197, 94, 0.15);
+  --positive-border: rgba(34, 197, 94, 0.3);
+  --positive-text: #22c55e;
+  --negative: #ef4444;
+  --shadow-sm: rgba(2, 6, 23, 0.5);
+  --shadow-lg: rgba(2, 6, 23, 0.7);
+}
+
+[data-theme="light"] {
+  /* Light theme */
+  --bg-primary: #f8fafc;
+  --bg-secondary: #ffffff;
+  --bg-card: rgba(255, 255, 255, 0.95);
+  --bg-card-hover: rgba(255, 255, 255, 1);
+  --bg-input: #ffffff;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  --text-placeholder: #94a3b8;
+  --border-primary: rgba(15, 23, 42, 0.1);
+  --border-secondary: rgba(15, 23, 42, 0.15);
+  --border-hover: rgba(15, 23, 42, 0.2);
+  --border-input: rgba(15, 23, 42, 0.2);
+  --accent-primary: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-text: #6366f1;
+  --positive: #059669;
+  --positive-bg: rgba(34, 197, 94, 0.1);
+  --positive-border: rgba(34, 197, 94, 0.4);
+  --positive-text: #059669;
+  --negative: #dc2626;
+  --shadow-sm: rgba(15, 23, 42, 0.08);
+  --shadow-lg: rgba(15, 23, 42, 0.12);
+}
+
 body {
   font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   margin: 0;
   padding: 0;
-  background: #0f172a;
-  color: #f8fafc;
+  background: var(--bg-primary);
+  color: var(--text-primary);
   font-size: 16px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 header {
@@ -19,13 +74,14 @@ header {
   top: 0;
   z-index: 100;
   padding: 16px 20px;
-  background: #020617;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-secondary);
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 16px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 2px 8px var(--shadow-sm);
+  transition: background-color 0.3s ease, border-color 0.3s ease;
 }
 
 header h1 {
@@ -45,7 +101,7 @@ header h1 {
 
 .header-left p {
   margin: 0;
-  color: #94a3b8;
+  color: var(--text-secondary);
   font-size: clamp(0.75rem, 2.5vw, 0.875rem);
 }
 
@@ -89,25 +145,26 @@ main {
 }
 
 .card {
-  background: rgba(15, 23, 42, 0.9);
-  border: 1px solid rgba(148, 163, 184, 0.15);
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
   border-radius: 16px;
   padding: 20px;
-  box-shadow: 0 4px 16px rgba(2, 6, 23, 0.5);
+  box-shadow: 0 4px 16px var(--shadow-sm);
   min-width: 0;
   transition: all 0.3s ease;
 }
 
 .card:hover {
-  box-shadow: 0 8px 24px rgba(2, 6, 23, 0.7);
-  border-color: rgba(148, 163, 184, 0.25);
+  box-shadow: 0 8px 24px var(--shadow-lg);
+  border-color: var(--border-hover);
+  background: var(--bg-card-hover);
 }
 
 .card h3 {
   margin: 0 0 12px 0;
   font-size: 1.125rem;
   font-weight: 600;
-  color: #f8fafc;
+  color: var(--text-primary);
 }
 
 /* Card header with actions */
@@ -133,7 +190,7 @@ main {
 
 .last-refresh {
   font-size: 0.75rem;
-  color: #94a3b8;
+  color: var(--text-secondary);
 }
 
 .refresh-btn {
@@ -142,7 +199,7 @@ main {
   gap: 6px;
   padding: 6px 12px;
   background: rgba(99, 102, 241, 0.15);
-  color: #a5b4fc;
+  color: var(--accent-text);
   border: 1px solid rgba(99, 102, 241, 0.3);
   border-radius: 6px;
   font-size: 0.75rem;
@@ -153,8 +210,9 @@ main {
 
 .refresh-btn:hover:not(:disabled) {
   background: rgba(99, 102, 241, 0.25);
-  color: #c7d2fe;
-  border-color: rgba(99, 102, 241, 0.5);
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  transform: translateY(-1px);
 }
 
 .refresh-btn:disabled {
@@ -173,6 +231,52 @@ main {
 
 .refresh-icon {
   flex-shrink: 0;
+}
+
+/* Theme toggle */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-secondary);
+  border-radius: 999px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: var(--bg-card);
+  transition: all 0.2s ease;
+}
+
+.theme-toggle button {
+  background: transparent;
+  color: var(--text-secondary);
+  border: none;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.75rem;
+  transition: all 0.2s ease;
+  min-width: 50px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.theme-toggle button:hover:not(.active) {
+  background: rgba(99, 102, 241, 0.1);
+  color: var(--text-primary);
+}
+
+.theme-toggle button.active {
+  background: var(--accent-primary);
+  color: #fff;
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.3);
+}
+
+.theme-toggle svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
 }
 
 /* Custom accounts section */
@@ -203,10 +307,10 @@ main {
   flex: 1;
   min-width: 150px;
   padding: 8px 12px;
-  background: rgba(15, 23, 42, 0.8);
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
   border-radius: 6px;
-  color: #f8fafc;
+  color: var(--text-primary);
   font-size: 0.875rem;
   font-family: inherit;
   transition: all 0.2s ease;
@@ -214,12 +318,12 @@ main {
 
 .custom-accounts-form input:focus {
   outline: none;
-  border-color: rgba(99, 102, 241, 0.5);
+  border-color: var(--accent-primary);
   box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
 }
 
 .custom-accounts-form input::placeholder {
-  color: #64748b;
+  color: var(--text-placeholder);
 }
 
 #custom-address-input {
@@ -236,9 +340,9 @@ main {
 
 .add-custom-btn {
   padding: 8px 16px;
-  background: rgba(34, 197, 94, 0.15);
-  color: #22c55e;
-  border: 1px solid rgba(34, 197, 94, 0.3);
+  background: var(--positive-bg);
+  color: var(--positive-text);
+  border: 1px solid var(--positive-border);
   border-radius: 6px;
   font-size: 0.75rem;
   font-weight: 600;
@@ -249,7 +353,8 @@ main {
 
 .add-custom-btn:hover:not(:disabled) {
   background: rgba(34, 197, 94, 0.25);
-  border-color: rgba(34, 197, 94, 0.5);
+  border-color: var(--positive);
+  transform: translateY(-1px);
 }
 
 .add-custom-btn:disabled {

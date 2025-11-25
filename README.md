@@ -88,14 +88,14 @@ Key variables (see `.env.example`):
 | `DATABASE_URL`   | `postgresql://hlbot:...@postgres`| Postgres DSN |
 | `SCOUT_SEEDS`    | 3 demo 0x addresses              | Initial candidates emitted on boot |
 | `SCOUT_URL`      | `http://hl-scout:8080`           | Used by hl-stream to refresh watchlist |
-| `LEADERBOARD_API_URL` | `https://hyperbot.network/...` | Hyperbot smart money API |
+| `LEADERBOARD_API_URL` | `https://...` | Leaderboard API URL |
 | `LEADERBOARD_TOP_N` | `1000` | Number of leaderboard entries fetched per period |
 | `LEADERBOARD_SELECT_COUNT` | `12` | Auto-tracked addresses pushed to hl-stream/hl-sage |
-| `LEADERBOARD_PERIODS` | `7,30` | Leaderboard periods (days) to crawl |
+| `LEADERBOARD_PERIODS` | `30` | Leaderboard period (days) to track |
 | `LEADERBOARD_REFRESH_MS` | `86400000` | Crawl cadence (ms) |
 | `LEADERBOARD_SORT` | `3` | Sort order: 0=WinRate, 1=AccountValue, 3=PnL, 4=Trades, 5=ProfitableTrades, 6=LastOp, 7=AvgHold, 8=Positions |
 | `LEADERBOARD_ENRICH_COUNT` | `12` | How many ranked wallets to enrich with stats + curves per refresh |
-| `LEADERBOARD_STATS_CONCURRENCY` | `4` | Parallel Hyperbot `query-addr-stat` requests |
+| `LEADERBOARD_STATS_CONCURRENCY` | `4` | Parallel leaderboard detail requests |
 | `LEADERBOARD_SERIES_CONCURRENCY` | `2` | Parallel Hyperliquid `portfolio` requests |
 | `*_PORT`         | `410{1-4}`                       | Host-forwarded HTTP ports |
 
@@ -151,7 +151,7 @@ docker compose down && docker compose build --no-cache && docker compose up -d
 ### hl-scout (TS)
 - Express API for addresses (`GET/POST/DELETE /addresses`).
 - `POST /admin/seed` & `/admin/backfill/:address` require `x-owner-key`.
-- Crawls the Hyperbot "smart" leaderboard on a schedule (configurable periods/top-N), scoring entries by win rate, PnL efficiency, and pnlList consistency, then publishes `a.candidates.v1` with weights/metadata.
+- Crawls the Hyperliquid leaderboard on a schedule (30-day period, top-N), scoring entries by win rate, PnL efficiency, and pnlList consistency, then publishes `a.candidates.v1` with weights/metadata.
 - On startup, automatically seeds the leaderboard if no entries exist.
 - Reuses Hyperliquid info/backfill helpers to warm Postgres (`hl_events`).  
 - Swagger UI at http://localhost:4101/docs.
@@ -181,15 +181,15 @@ Open http://localhost:4102/dashboard to monitor the stack:
 - Address performance table (win rate, trades, efficiency, realized PnL, Hyperliquid tx counts).
 - Live fills feed streamed from Hyperliquid userEvents via `/ws`.
 - Decision panel (tickets + outcomes) and a recommendation card highlighting the best-performing address. Address rows include Hyperliquid profile metadata (via the `userDetails` Info API). The highlighted address also powers the “push to user” recommendation data returned by `GET /dashboard/summary`.
-- Use the top-right toggle to switch the leaderboard view between 30-day and 7-day periods.
+- Shows top performance over the last 30 days with composite scoring.
 
-## Smart Leaderboard Ingest
+## Leaderboard Ingest
 
-`hl-scout` crawls Hyperbot’s smart leaderboard (`https://hyperbot.network/api/leaderboard/smart`) for each configured period (defaults: 7d and 30d). For every refresh it:
+`hl-scout` crawls the Hyperliquid leaderboard for the 30-day period. For every refresh it:
 
 1. Fetches the top `LEADERBOARD_TOP_N` addresses sorted by realized PnL.
 2. Computes derived metrics (win rate safety, trade efficiency, realized PnL, pnlList consistency) and scores each wallet.
-3. Enriches the top `LEADERBOARD_ENRICH_COUNT` entries with Hyperbot `query-addr-stat` + Hyperliquid `portfolio` data, storing stats on `hl_leaderboard_entries` and time-series in `hl_leaderboard_pnl_points`.
+3. Enriches the top `LEADERBOARD_ENRICH_COUNT` entries with Hyperliquid leaderboard details and `portfolio` data, storing stats on `hl_leaderboard_entries` and time-series in `hl_leaderboard_pnl_points`.
 4. Persists the scored rows to `hl_leaderboard_entries`, exposes them via `/leaderboard`/`/leaderboard/selected`, and emits `a.candidates.v1` events with weights + metadata.
 
 `hl-stream` consumes the selected list (default 12 addresses) to drive realtime Hyperliquid subscriptions, while `hl-sage` combines the weights with live fills and inferred positions to publish `b.scores.v1` follow signals.

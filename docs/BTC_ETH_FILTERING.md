@@ -14,11 +14,7 @@ The leaderboard ranking system applies an additional filtering rule to ensure se
 
 ## API Endpoint
 
-The filter uses the Hyperbot completed trades API:
-
-```
-GET https://hyperbot.network/api/leaderboard/smart/completed-trades/{address}?take=2000
-```
+The filter fetches completed trades data for each address (up to 2000 most recent trades).
 
 **Response Structure**:
 ```json
@@ -69,7 +65,7 @@ GET https://hyperbot.network/api/leaderboard/smart/completed-trades/{address}?ta
    - Realized PnL (10%)
 
 2. **Enrichment**: Top N accounts (configured via `LEADERBOARD_ENRICH_COUNT`) are enriched with:
-   - Detailed stats from Hyperbot API
+   - Detailed stats from leaderboard API
    - Portfolio series from Hyperliquid
    - **BTC/ETH trade analysis** (NEW)
 
@@ -104,7 +100,7 @@ Environment variables controlling this feature:
 
 For each candidate account:
 
-1. **Fetch trades**: Retrieve up to 2000 most recent completed trades from Hyperbot API
+1. **Fetch trades**: Retrieve up to 2000 most recent completed trades from leaderboard API
 2. **Filter by duration**: Only include trades where `endTime - startTime >= 10 minutes`
 3. **Filter by coin**: Only process trades where `coin` field equals "BTC" or "ETH" (case-insensitive)
 4. **Sum PnL**: Aggregate `pnl` values separately for BTC and ETH

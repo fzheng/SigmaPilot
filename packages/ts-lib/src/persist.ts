@@ -32,6 +32,18 @@ export async function insertEvent(evt: InsertableEvent): Promise<number | null> 
   }
 }
 
+export async function clearPositionsForAddress(address: string): Promise<void> {
+  try {
+    const p = await getPool();
+    await p.query(
+      'DELETE FROM hl_current_positions WHERE address = $1',
+      [address]
+    );
+  } catch (e) {
+    console.error('[persist] clearPositionsForAddress failed:', { address, error: e });
+  }
+}
+
 export async function upsertCurrentPosition(args: {
   address: string;
   symbol: 'BTC' | 'ETH';
@@ -44,6 +56,17 @@ export async function upsertCurrentPosition(args: {
 }): Promise<void> {
   try {
     const p = await getPool();
+
+    // If position is closed (size = 0), delete the record
+    if (args.size === 0) {
+      await p.query(
+        'DELETE FROM hl_current_positions WHERE address = $1 AND symbol = $2',
+        [args.address, args.symbol]
+      );
+      return;
+    }
+
+    // Otherwise upsert the position
     await p.query(
       `insert into hl_current_positions(address, symbol, size, entry_price, liquidation_price, leverage, pnl, updated_at)
        values ($1,$2,$3,$4,$5,$6,$7,$8)

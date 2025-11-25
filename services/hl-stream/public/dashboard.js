@@ -1,10 +1,53 @@
+// Theme management
+const themeButtons = document.querySelectorAll('.theme-toggle button');
+let currentTheme = localStorage.getItem('theme') || 'auto';
+let currentSymbol = 'BTCUSDT'; // Track current chart symbol
+
+function getSystemTheme() {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function applyTheme(theme, reloadChart = false) {
+  const effectiveTheme = theme === 'auto' ? getSystemTheme() : theme;
+  document.documentElement.setAttribute('data-theme', effectiveTheme);
+
+  // Update active button
+  themeButtons.forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-theme') === theme);
+  });
+
+  currentTheme = theme;
+  localStorage.setItem('theme', theme);
+
+  // Reload chart with new theme if requested
+  if (reloadChart && typeof renderChart === 'function') {
+    renderChart(currentSymbol);
+  }
+}
+
+// Initialize theme
+applyTheme(currentTheme);
+
+// Listen to system theme changes when in auto mode
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (currentTheme === 'auto') {
+    applyTheme('auto', true);
+  }
+});
+
+// Theme toggle buttons
+themeButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    applyTheme(btn.getAttribute('data-theme'), true);
+  });
+});
+
 const statusEl = document.getElementById('dashboard-status');
 const addressTable = document.getElementById('address-table');
 const fillsTable = document.getElementById('fills-table');
 const decisionsList = document.getElementById('decisions-list');
 const recommendationCard = document.getElementById('recommendation-card');
 const symbolButtons = document.querySelectorAll('.toggle-group button');
-const periodButtons = document.querySelectorAll('.period-toggle button');
 const lastRefreshEl = document.getElementById('last-refresh');
 const refreshBtn = document.getElementById('refresh-btn');
 const customCountEl = document.getElementById('custom-count');
@@ -377,6 +420,10 @@ function connectWs() {
 
 function renderChart(symbol) {
   const draw = () => {
+    // Determine current theme
+    const effectiveTheme = currentTheme === 'auto' ? getSystemTheme() : currentTheme;
+    const tvTheme = effectiveTheme === 'light' ? 'light' : 'dark';
+
     document.getElementById('tradingview_chart').innerHTML = '';
     // eslint-disable-next-line no-undef
     new TradingView.widget({
@@ -384,7 +431,7 @@ function renderChart(symbol) {
       symbol: `BINANCE:${symbol}`,
       interval: '60',
       timezone: 'Etc/UTC',
-      theme: 'dark',
+      theme: tvTheme,
       style: '1',
       locale: 'en',
       container_id: 'tradingview_chart',
@@ -404,21 +451,13 @@ function initChartControls() {
     btn.addEventListener('click', () => {
       symbolButtons.forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
-      renderChart(btn.dataset.symbol || 'BTCUSDT');
+      currentSymbol = btn.dataset.symbol || 'BTCUSDT';
+      renderChart(currentSymbol);
     });
   });
 }
 
-function initPeriodControls() {
-  periodButtons.forEach((btn) => {
-    btn.addEventListener('click', () => {
-      periodButtons.forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      dashboardPeriod = Number(btn.dataset.period || 30);
-      refreshSummary();
-    });
-  });
-}
+// Period controls removed - now fixed to 30 days
 
 // Show error message in custom accounts section
 function showCustomError(message) {
@@ -691,7 +730,6 @@ function initRefreshButton() {
 
 function init() {
   initChartControls();
-  initPeriodControls();
   initCustomAccountsControls();
   initRefreshButton();
   renderChart('BTCUSDT');
