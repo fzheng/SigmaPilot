@@ -107,6 +107,30 @@ type PortfolioWindowSeries = {
   equityHistory: Array<{ ts: number; value: number }>;
 };
 
+type CompletedTrade = {
+  address: string;
+  coin: string;
+  marginMode: string;
+  direction: string;
+  size: number;
+  entryPrice: number;
+  startTime: string;
+  endTime: string;
+  closePrice: number;
+  totalFee: number;
+  pnl: number;
+};
+
+type BtcEthAnalysis = {
+  btcPnl: number;
+  ethPnl: number;
+  totalPnl: number;
+  btcEthPnl: number;
+  btcEthRatio: number;
+  qualified: boolean;
+  reason?: string;
+};
+
 export interface LeaderboardOptions {
   apiUrl?: string;
   topN?: number;
@@ -208,8 +232,17 @@ export class LeaderboardService {
     }
 
     await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
-    await this.publishTopCandidates(period, ranked.slice(0, this.opts.selectCount));
-    this.logger.info('leaderboard_updated', { period, count: ranked.length });
+
+    // Apply BTC/ETH filtering to get top qualified candidates
+    const qualifiedCandidates = await this.filterBtcEthQualified(ranked, this.opts.selectCount);
+    await this.publishTopCandidates(period, qualifiedCandidates);
+
+    this.logger.info('leaderboard_updated', {
+      period,
+      count: ranked.length,
+      qualified: qualifiedCandidates.length,
+      target: this.opts.selectCount
+    });
   }
 
   private async fetchPeriod(period: number): Promise<LeaderboardRawEntry[]> {
@@ -485,6 +518,146 @@ export class LeaderboardService {
       this.logger.warn('portfolio_fetch_failed', { address: normalized, err: err?.message });
       return null;
     }
+  }
+
+  /**
+   * Fetch and analyze BTC/ETH trades for an address.
+   * Returns analysis of BTC+ETH PnL contribution to total PnL.
+   *
+   * API: GET https://hyperbot.network/api/leaderboard/smart/completed-trades/{address}?take=2000
+   */
+  private async analyzeBtcEthTrades(address: string, totalPnl: number): Promise<BtcEthAnalysis> {
+    const normalized = normalizeAddress(address);
+    const url = `${this.smartApiBase}completed-trades/${encodeURIComponent(normalized)}?take=2000`;
+
+    try {
+      const payload = await this.requestJson<any>(url, { method: 'GET' }, 2, 8000);
+      const trades: CompletedTrade[] = Array.isArray(payload?.data) ? payload.data : [];
+
+      let btcPnl = 0;
+      let ethPnl = 0;
+
+      for (const trade of trades) {
+        const coin = String(trade.coin || '').toUpperCase();
+        const pnl = Number(trade.pnl || 0);
+
+        if (coin === 'BTC') {
+          btcPnl += pnl;
+        } else if (coin === 'ETH') {
+          ethPnl += pnl;
+        }
+      }
+
+      const btcEthPnl = btcPnl + ethPnl;
+      const btcEthRatio = totalPnl !== 0 ? Math.abs(btcEthPnl / totalPnl) : 0;
+
+      // Qualification rules:
+      // 1. If BTC+ETH combined PnL < 0, reject
+      // 2. If BTC+ETH contribution < 10% of total PnL, reject
+      let qualified = true;
+      let reason: string | undefined;
+
+      if (btcEthPnl < 0) {
+        qualified = false;
+        reason = 'btc_eth_negative_pnl';
+      } else if (btcEthRatio < 0.10) {
+        qualified = false;
+        reason = 'btc_eth_insufficient_contribution';
+      }
+
+      return {
+        btcPnl,
+        ethPnl,
+        totalPnl,
+        btcEthPnl,
+        btcEthRatio,
+        qualified,
+        reason,
+      };
+    } catch (err: any) {
+      this.logger.warn('btc_eth_analysis_failed', { address: normalized, err: err?.message });
+      // On error, assume not qualified to be conservative
+      return {
+        btcPnl: 0,
+        ethPnl: 0,
+        totalPnl,
+        btcEthPnl: 0,
+        btcEthRatio: 0,
+        qualified: false,
+        reason: 'api_fetch_failed',
+      };
+    }
+  }
+
+  /**
+   * Filter ranked entries to select top qualified candidates based on BTC/ETH trading.
+   * Continues checking candidates until we have the target number of qualified accounts.
+   *
+   * Rules:
+   * 1. If BTC+ETH combined PnL < 0, skip account
+   * 2. If BTC+ETH contribution < 10% of total PnL, skip account
+   * 3. Continue until we have targetCount qualified accounts
+   */
+  private async filterBtcEthQualified(ranked: RankedEntry[], targetCount: number): Promise<RankedEntry[]> {
+    const qualified: RankedEntry[] = [];
+    const maxCandidates = Math.min(ranked.length, targetCount * 5); // Check up to 5x target to find qualified
+
+    for (let i = 0; i < maxCandidates && qualified.length < targetCount; i++) {
+      const entry = ranked[i];
+
+      // Skip custom accounts - they bypass this filter
+      const isCustom = entry.meta?.custom === true || entry.meta?.custom === 'true';
+      if (isCustom) {
+        qualified.push(entry);
+        continue;
+      }
+
+      // Use the entry's totalPnl from stats, or fall back to realizedPnl
+      const totalPnl = entry.statTotalPnl ?? entry.realizedPnl;
+
+      const analysis = await this.analyzeBtcEthTrades(entry.address, totalPnl);
+
+      if (analysis.qualified) {
+        // Add BTC/ETH analysis to entry metadata
+        entry.meta = {
+          ...entry.meta,
+          btcEthAnalysis: {
+            btcPnl: analysis.btcPnl,
+            ethPnl: analysis.ethPnl,
+            btcEthPnl: analysis.btcEthPnl,
+            btcEthRatio: analysis.btcEthRatio,
+            qualified: true,
+          },
+        };
+        qualified.push(entry);
+        this.logger.info('btc_eth_qualified', {
+          address: entry.address,
+          rank: entry.rank,
+          btcEthRatio: analysis.btcEthRatio.toFixed(2),
+          btcPnl: analysis.btcPnl.toFixed(2),
+          ethPnl: analysis.ethPnl.toFixed(2),
+        });
+      } else {
+        this.logger.info('btc_eth_filtered', {
+          address: entry.address,
+          rank: entry.rank,
+          reason: analysis.reason,
+          btcEthRatio: analysis.btcEthRatio.toFixed(2),
+          btcPnl: analysis.btcPnl.toFixed(2),
+          ethPnl: analysis.ethPnl.toFixed(2),
+        });
+      }
+    }
+
+    if (qualified.length < targetCount) {
+      this.logger.warn('btc_eth_insufficient_qualified', {
+        qualified: qualified.length,
+        target: targetCount,
+        checked: Math.min(maxCandidates, ranked.length),
+      });
+    }
+
+    return qualified;
   }
 
   private async requestJson<T>(
