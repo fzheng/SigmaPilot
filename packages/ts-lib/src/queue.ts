@@ -4,7 +4,7 @@ export type ChangeEvent =
       seq: number;
       at: string;
       address: string;
-      symbol: 'BTC';
+      symbol: 'BTC' | 'ETH';
       size: number; // signed
       side: 'long' | 'short' | 'flat';
       entryPriceUsd: number | null;
@@ -17,7 +17,7 @@ export type ChangeEvent =
       seq: number;
       at: string;
       address: string;
-      symbol: 'BTC';
+      symbol: 'BTC' | 'ETH';
       side: 'buy' | 'sell';
       direction: 'long' | 'short' | 'flat';
       effect: 'open' | 'close';

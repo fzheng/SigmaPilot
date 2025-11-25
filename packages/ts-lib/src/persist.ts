@@ -14,7 +14,7 @@ export type InsertableEvent = {
   type: 'position' | 'trade';
   at: string; // ISO
   address: string;
-  symbol: 'BTC';
+  symbol: 'BTC' | 'ETH';
   payload: Record<string, unknown>; // stored as JSON
 };
 
@@ -34,7 +34,7 @@ export async function insertEvent(evt: InsertableEvent): Promise<number | null> 
 
 export async function upsertCurrentPosition(args: {
   address: string;
-  symbol: 'BTC';
+  symbol: 'BTC' | 'ETH';
   size: number;
   entryPriceUsd: number | null;
   liquidationPriceUsd: number | null;
@@ -47,8 +47,7 @@ export async function upsertCurrentPosition(args: {
     await p.query(
       `insert into hl_current_positions(address, symbol, size, entry_price, liquidation_price, leverage, pnl, updated_at)
        values ($1,$2,$3,$4,$5,$6,$7,$8)
-       on conflict(address) do update set
-         symbol=excluded.symbol,
+       on conflict(address, symbol) do update set
          size=excluded.size,
          entry_price=excluded.entry_price,
          liquidation_price=excluded.liquidation_price,

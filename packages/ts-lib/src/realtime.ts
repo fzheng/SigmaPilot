@@ -29,7 +29,7 @@ export class RealtimeTracker {
   private http: any; // HttpTransport
   private wsImpl: any; // WS ctor from 'ws' (lazy)
   private subs: Map<Address, { ch?: any; ue?: any; ueTransport?: any }>; // subs + per-address UE transport
-  private snapshots: Map<Address, { data: PositionSnapshot; updatedAt: string }>;
+  private snapshots: Map<string, { data: PositionSnapshot; updatedAt: string }>; // key: "address:symbol"
   private getAddresses: () => Promise<Address[]>;
   private q: EventQueue;
   private primeInflight: Map<Address, Promise<void>>;
@@ -129,7 +129,9 @@ export class RealtimeTracker {
     }
 
     this.subs.set(addr, subs);
-    if (!this.snapshots.has(addr)) {
+    // Prime if we don't have any snapshots for this address yet
+    const hasAnySnapshot = Array.from(this.snapshots.keys()).some(key => key.startsWith(`${addr}:`));
+    if (!hasAnySnapshot) {
       void this.primeFromHttp(addr);
     }
   }
@@ -137,61 +139,67 @@ export class RealtimeTracker {
   private onClearinghouse(addr: Address, evt: any) {
     try {
       const positions = evt?.clearinghouseState?.assetPositions || [];
-      let btc: any | null = null;
+
+      // Process both BTC and ETH positions
       for (const ap of positions as any[]) {
-        const coin = (ap as any)?.position?.coin ?? '';
-        if (typeof coin === 'string' && /^btc$/i.test(coin)) { btc = ap; break; }
-      }
-      const szi = Number(btc?.position?.szi ?? 0);
-      const entry = Number(btc?.position?.entryPx ?? NaN);
-      const levValue = Number(btc?.position?.leverage?.value ?? NaN);
-      const liq = Number(btc?.position?.liquidationPx ?? NaN);
+        const coin = String((ap as any)?.position?.coin ?? '').toUpperCase();
+        if (coin !== 'BTC' && coin !== 'ETH') continue;
 
-      const snapshot: PositionSnapshot = {
-        size: Number.isFinite(szi) ? szi : 0,
-        entryPriceUsd: Number.isFinite(entry) ? entry : null,
-        liquidationPriceUsd: Number.isFinite(liq) ? liq : null,
-        leverage: Number.isFinite(levValue) ? levValue : null,
-      };
+        const szi = Number(ap?.position?.szi ?? 0);
+        const entry = Number(ap?.position?.entryPx ?? NaN);
+        const levValue = Number(ap?.position?.leverage?.value ?? NaN);
+        const liq = Number(ap?.position?.liquidationPx ?? NaN);
 
-      const prev = this.snapshots.get(addr)?.data;
-      const changed = !prev
-        || prev.size !== snapshot.size
-        || prev.entryPriceUsd !== snapshot.entryPriceUsd
-        || prev.liquidationPriceUsd !== snapshot.liquidationPriceUsd
-        || prev.leverage !== snapshot.leverage;
+        const snapshot: PositionSnapshot = {
+          size: Number.isFinite(szi) ? szi : 0,
+          entryPriceUsd: Number.isFinite(entry) ? entry : null,
+          liquidationPriceUsd: Number.isFinite(liq) ? liq : null,
+          leverage: Number.isFinite(levValue) ? levValue : null,
+        };
 
-      if (changed) {
-        const updatedAt = new Date().toISOString();
-        this.snapshots.set(addr, { data: snapshot, updatedAt });
-        const mark = (getCurrentBtcPrice().price ?? null) as number | null;
-        const pnl = (snapshot.entryPriceUsd != null && mark != null)
-          ? snapshot.size * (mark - snapshot.entryPriceUsd)
-          : null;
-        const evt = this.q.push({
-          type: 'position',
-          at: updatedAt,
-          address: addr,
-          symbol: 'BTC',
-          size: snapshot.size,
-          side: sideFromSize(snapshot.size),
-          entryPriceUsd: snapshot.entryPriceUsd,
-          liquidationPriceUsd: snapshot.liquidationPriceUsd,
-          leverage: snapshot.leverage,
-          pnlUsd: pnl,
-        });
-        insertEvent({ type: 'position', at: evt.at, address: addr, symbol: 'BTC', payload: evt })
-          .catch((err) => console.error('[realtime] insertEvent failed:', err));
-        upsertCurrentPosition({
-          address: addr,
-          symbol: 'BTC',
-          size: snapshot.size,
-          entryPriceUsd: snapshot.entryPriceUsd,
-          liquidationPriceUsd: snapshot.liquidationPriceUsd,
-          leverage: snapshot.leverage,
-          pnlUsd: pnl,
-          updatedAt,
-        }).catch((err) => console.error('[realtime] upsertCurrentPosition failed:', err));
+        const snapshotKey = `${addr}:${coin}`;
+        const prev = this.snapshots.get(snapshotKey)?.data;
+        const changed = !prev
+          || prev.size !== snapshot.size
+          || prev.entryPriceUsd !== snapshot.entryPriceUsd
+          || prev.liquidationPriceUsd !== snapshot.liquidationPriceUsd
+          || prev.leverage !== snapshot.leverage;
+
+        if (changed) {
+          const updatedAt = new Date().toISOString();
+          this.snapshots.set(snapshotKey, { data: snapshot, updatedAt });
+
+          // For now, only BTC has price tracking; ETH PnL will be null
+          const mark = coin === 'BTC' ? (getCurrentBtcPrice().price ?? null) as number | null : null;
+          const pnl = (snapshot.entryPriceUsd != null && mark != null)
+            ? snapshot.size * (mark - snapshot.entryPriceUsd)
+            : null;
+
+          const evt = this.q.push({
+            type: 'position',
+            at: updatedAt,
+            address: addr,
+            symbol: coin,
+            size: snapshot.size,
+            side: sideFromSize(snapshot.size),
+            entryPriceUsd: snapshot.entryPriceUsd,
+            liquidationPriceUsd: snapshot.liquidationPriceUsd,
+            leverage: snapshot.leverage,
+            pnlUsd: pnl,
+          });
+          insertEvent({ type: 'position', at: evt.at, address: addr, symbol: coin, payload: evt })
+            .catch((err) => console.error('[realtime] insertEvent failed:', err));
+          upsertCurrentPosition({
+            address: addr,
+            symbol: coin,
+            size: snapshot.size,
+            entryPriceUsd: snapshot.entryPriceUsd,
+            liquidationPriceUsd: snapshot.liquidationPriceUsd,
+            leverage: snapshot.leverage,
+            pnlUsd: pnl,
+            updatedAt,
+          }).catch((err) => console.error('[realtime] upsertCurrentPosition failed:', err));
+        }
       }
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -206,8 +214,9 @@ export class RealtimeTracker {
       const fills: any[] = Array.isArray(evt.fills) ? evt.fills : [];
       let touched = false;
       for (const f of fills) {
-        const coin = f?.coin ?? '';
-        if (!/^btc$/i.test(String(coin))) continue;
+        const coin = String(f?.coin ?? '').toUpperCase();
+        // Only process BTC and ETH fills
+        if (coin !== 'BTC' && coin !== 'ETH') continue;
         const px = Number(f?.px ?? NaN);
         const sz = Number(f?.sz ?? NaN);
         const side = f?.side === 'B' ? 'buy' : 'sell';
@@ -239,7 +248,7 @@ export class RealtimeTracker {
         const persistencePayload = {
           at,
           address: addr,
-          symbol: 'BTC',
+          symbol: coin,
           action: actionLabel,
           size: Math.abs(sz),
           startPosition,
@@ -254,7 +263,7 @@ export class RealtimeTracker {
           type: 'trade',
           at,
           address: addr,
-          symbol: 'BTC',
+          symbol: coin,
           side,
           direction,
           effect,
@@ -282,7 +291,7 @@ export class RealtimeTracker {
 
   getAllSnapshots(): Array<{
     address: string;
-    symbol: 'BTC';
+    symbol: 'BTC' | 'ETH';
     size: number;
     side: 'long' | 'short' | 'flat';
     entryPriceUsd: number | null;
@@ -291,10 +300,10 @@ export class RealtimeTracker {
     pnlUsd: number | null;
     updatedAt: string;
   }> {
-    const mark = (getCurrentBtcPrice().price ?? null) as number | null;
+    const btcMark = (getCurrentBtcPrice().price ?? null) as number | null;
     const out: Array<{
       address: string;
-      symbol: 'BTC';
+      symbol: 'BTC' | 'ETH';
       size: number;
       side: 'long' | 'short' | 'flat';
       entryPriceUsd: number | null;
@@ -303,13 +312,17 @@ export class RealtimeTracker {
       pnlUsd: number | null;
       updatedAt: string;
     }> = [];
-    for (const [address, { data, updatedAt }] of this.snapshots.entries()) {
+    for (const [key, { data, updatedAt }] of this.snapshots.entries()) {
+      // key format: "address:symbol"
+      const [address, symbol] = key.split(':');
+      // For now, only BTC has price tracking
+      const mark = symbol === 'BTC' ? btcMark : null;
       const pnl = (data.entryPriceUsd != null && mark != null)
         ? data.size * (mark - data.entryPriceUsd)
         : null;
       out.push({
         address,
-        symbol: 'BTC',
+        symbol: (symbol || 'BTC') as 'BTC' | 'ETH',
         size: data.size,
         side: sideFromSize(data.size),
         entryPriceUsd: data.entryPriceUsd,
@@ -319,8 +332,11 @@ export class RealtimeTracker {
         updatedAt,
       });
     }
-    // sort by address for stable output
-    out.sort((a, b) => a.address.localeCompare(b.address));
+    // sort by address and symbol for stable output
+    out.sort((a, b) => {
+      const addrCmp = a.address.localeCompare(b.address);
+      return addrCmp !== 0 ? addrCmp : a.symbol.localeCompare(b.symbol);
+    });
     return out;
   }
 
@@ -352,51 +368,59 @@ export class RealtimeTracker {
         { user }
       );
       const positions = data.assetPositions || [];
-      let btc: any | null = null;
+
+      // Process both BTC and ETH positions
       for (const ap of positions as any[]) {
-        const coin = (ap as any)?.position?.coin ?? '';
-        if (typeof coin === 'string' && /^btc$/i.test(coin)) { btc = ap; break; }
+        const coin = String((ap as any)?.position?.coin ?? '').toUpperCase();
+        if (coin !== 'BTC' && coin !== 'ETH') continue;
+
+        const szi = Number(ap?.position?.szi ?? 0);
+        const entry = Number(ap?.position?.entryPx ?? NaN);
+        const levValue = Number(ap?.position?.leverage?.value ?? NaN);
+        const liq = Number(ap?.position?.liquidationPx ?? NaN);
+
+        const snapshot: PositionSnapshot = {
+          size: Number.isFinite(szi) ? szi : 0,
+          entryPriceUsd: Number.isFinite(entry) ? entry : null,
+          liquidationPriceUsd: Number.isFinite(liq) ? liq : null,
+          leverage: Number.isFinite(levValue) ? levValue : null,
+        };
+
+        const updatedAt = new Date().toISOString();
+        const snapshotKey = `${addr}:${coin}`;
+        this.snapshots.set(snapshotKey, { data: snapshot, updatedAt });
+
+        // For now, only BTC has price tracking
+        const mark = coin === 'BTC' ? (getCurrentBtcPrice().price ?? null) as number | null : null;
+        const pnl = (snapshot.entryPriceUsd != null && mark != null)
+          ? snapshot.size * (mark - snapshot.entryPriceUsd)
+          : null;
+
+        const evt = this.q.push({
+          type: 'position',
+          at: updatedAt,
+          address: addr,
+          symbol: coin,
+          size: snapshot.size,
+          side: sideFromSize(snapshot.size),
+          entryPriceUsd: snapshot.entryPriceUsd,
+          liquidationPriceUsd: snapshot.liquidationPriceUsd,
+          leverage: snapshot.leverage,
+          pnlUsd: pnl,
+        });
+        insertEvent({ type: 'position', at: evt.at, address: addr, symbol: coin, payload: evt })
+          .catch((err) => console.error('[realtime] performPrime insertEvent failed:', err));
+        upsertCurrentPosition({
+          address: addr,
+          symbol: coin,
+          size: snapshot.size,
+          entryPriceUsd: snapshot.entryPriceUsd,
+          liquidationPriceUsd: snapshot.liquidationPriceUsd,
+          leverage: snapshot.leverage,
+          pnlUsd: pnl,
+          updatedAt,
+        }).catch((err) => console.error('[realtime] performPrime upsertCurrentPosition failed:', err));
       }
-      const szi = Number(btc?.position?.szi ?? 0);
-      const entry = Number(btc?.position?.entryPx ?? NaN);
-      const levValue = Number(btc?.position?.leverage?.value ?? NaN);
-      const liq = Number(btc?.position?.liquidationPx ?? NaN);
-      const snapshot: PositionSnapshot = {
-        size: Number.isFinite(szi) ? szi : 0,
-        entryPriceUsd: Number.isFinite(entry) ? entry : null,
-        liquidationPriceUsd: Number.isFinite(liq) ? liq : null,
-        leverage: Number.isFinite(levValue) ? levValue : null,
-      };
-      const updatedAt = new Date().toISOString();
-      this.snapshots.set(addr, { data: snapshot, updatedAt });
-      const mark = (getCurrentBtcPrice().price ?? null) as number | null;
-      const pnl = (snapshot.entryPriceUsd != null && mark != null)
-        ? snapshot.size * (mark - snapshot.entryPriceUsd)
-        : null;
-      const evt = this.q.push({
-        type: 'position',
-        at: updatedAt,
-        address: addr,
-        symbol: 'BTC',
-        size: snapshot.size,
-        side: sideFromSize(snapshot.size),
-        entryPriceUsd: snapshot.entryPriceUsd,
-        liquidationPriceUsd: snapshot.liquidationPriceUsd,
-        leverage: snapshot.leverage,
-        pnlUsd: pnl,
-      });
-      insertEvent({ type: 'position', at: evt.at, address: addr, symbol: 'BTC', payload: evt })
-        .catch((err) => console.error('[realtime] performPrime insertEvent failed:', err));
-      upsertCurrentPosition({
-        address: addr,
-        symbol: 'BTC',
-        size: snapshot.size,
-        entryPriceUsd: snapshot.entryPriceUsd,
-        liquidationPriceUsd: snapshot.liquidationPriceUsd,
-        leverage: snapshot.leverage,
-        pnlUsd: pnl,
-        updatedAt,
-      }).catch((err) => console.error('[realtime] performPrime upsertCurrentPosition failed:', err));
     } catch (e) {
       console.error('[realtime] performPrime failed:', { address: addr, error: e });
     }
