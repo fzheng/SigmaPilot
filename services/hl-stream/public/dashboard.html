@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>HL Trader Intelligence</title>
+    <link rel="stylesheet" href="/dashboard/static/dashboard.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <header>
+      <div class="header-left">
+        <h1>HL Trader Intelligence</h1>
+        <p id="dashboard-status">Loading stats…</p>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <div class="period-toggle">
+          <span class="period-label">Last 30 Days</span>
+        </div>
+        <div class="theme-toggle">
+          <button data-theme="dark" title="Dark theme">
+            <svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+          <button data-theme="light" title="Light theme">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          </button>
+          <button data-theme="auto" class="active" title="Auto (system)">
+            <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
+          </button>
+        </div>
+      </div>
+    </header>
+    <main>
+      <section class="card">
+        <div class="toggle-group">
+          <button class="active" data-symbol="BTCUSDT">BTC</button>
+          <button data-symbol="ETHUSDT">ETH</button>
+        </div>
+        <div id="tradingview_chart" class="chart-container"></div>
+      </section>
+
+      <section class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <h3>Top Performance (Last 30 Days)</h3>
+            <div class="card-actions">
+              <span id="last-refresh" class="last-refresh">Last updated: —</span>
+              <button id="refresh-btn" class="refresh-btn" title="Refresh leaderboard">
+                <svg class="refresh-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                </svg>
+                <span>Refresh</span>
+              </button>
+            </div>
+          </div>
+          <span class="metric-hint">Live leaderboard data from Hyperliquid. Ranked by composite performance score. <span class="custom-badge">★</span> indicates custom-tracked accounts.</span>
+
+          <!-- Custom Accounts Section -->
+          <div class="custom-accounts-section">
+            <div class="custom-accounts-header">
+              <span>Custom Accounts (<span id="custom-count">0</span>/3)</span>
+            </div>
+            <div class="custom-accounts-form">
+              <input type="text" id="custom-address-input" placeholder="Enter Ethereum address (0x...)" maxlength="42" />
+              <input type="text" id="custom-nickname-input" placeholder="Nickname (optional)" maxlength="32" />
+              <button id="add-custom-btn" class="add-custom-btn" title="Add custom account">Add</button>
+            </div>
+            <div id="custom-accounts-error" class="custom-accounts-error"></div>
+          </div>
+
+          <div class="table-wrapper">
+            <table class="stats-table">
+              <thead>
+                <tr>
+                  <th>Address</th>
+                  <th>Win Rate</th>
+                  <th>Trades</th>
+                  <th>Holdings</th>
+                  <th>Realized PnL</th>
+                  <th>Score</th>
+                </tr>
+              </thead>
+              <tbody id="address-table"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Recommendation</h3>
+          <div class="recommendation" id="recommendation-card">
+            <p>Waiting for data…</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid-2">
+        <div class="card fills-card">
+          <div class="card-header">
+            <h3>Live Fills (BTC/ETH)</h3>
+            <div class="fills-meta">
+              <span id="fills-time-range" class="time-range">No fills yet</span>
+            </div>
+          </div>
+          <div class="table-wrapper fills-scroll-container" id="fills-scroll-container">
+            <table class="stats-table fills-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Address</th>
+                  <th>Action</th>
+                  <th>Size</th>
+                  <th>Previous Position</th>
+                  <th>Price</th>
+                  <th>Closed PnL</th>
+                </tr>
+              </thead>
+              <tbody id="fills-table"></tbody>
+            </table>
+            <div id="fills-load-more" class="load-more-indicator" style="display: none;">
+              <span class="load-more-spinner"></span>
+              <span>Loading more fills...</span>
+            </div>
+            <div id="fills-load-history" class="load-history-btn-container">
+              <button id="load-history-btn" class="load-history-btn">Load Historical Fills</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Decisions</h3>
+          <ul class="decisions-list" id="decisions-list"></ul>
+        </div>
+      </section>
+    </main>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script type="module" src="/dashboard/static/dashboard.js"></script>
+  </body>
+</html>

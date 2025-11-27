@@ -81,6 +81,8 @@ out
 # Nuxt.js build / generate output
 .nuxt
 dist
+services/**/dist
+packages/**/dist
 data/
 
 # Gatsby files
@@ -138,3 +140,7 @@ data/
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Claude Code files
+CLAUDE.md
+.claude/

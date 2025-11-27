@@ -1,225 +1,273 @@
-# hlbot
+# hlbot Platform (Phase 1)
 
 ![Coverage](badges/coverage.svg) [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-brightgreen.svg?style=flat-square)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
-Single‑tenant Hyperliquid BTC perp tracker with real‑time fills & positions, time‑based pagination, and a minimal responsive UI.
+Phase 1 refactors the legacy single-process tracker into a four-service monorepo with shared Postgres, NATS JetStream, JSON-schema-backed contracts, and an end-to-end fake flow (Candidates → Scores → Fills → Signals → Outcomes).
 
-> NOTE: The legacy recommendation & poller system has been removed. Trade pagination now uses a timestamp+id cursor (`beforeAt` + `beforeId`) for strict chronological ordering.
+```
+services/
+  hl-scout   TypeScript  — address ingest + seeding + candidate emitter
+  hl-stream  TypeScript  — watcher/WS + real-time fill publisher + dashboard
+  hl-sage    Python      — scoring + ranks API
+  hl-decide  Python      — decision engine + tickets/outcomes
+contracts/              — jsonschema + generated zod & pydantic bindings
+docker/postgres-init    — SQL auto-run when Postgres initializes a fresh volume
+```
 
 ## Quick Start
 
-1. Prereqs: Node.js 18+, npm (or pnpm).
-2. Install: `npm install`
-3. Dev (in‑memory storage): `npm run dev` → http://localhost:3000
-
-### With Postgres (recommended)
 ```bash
-docker compose up -d db
-export STORAGE_BACKEND=postgres
-export DATABASE_URL=postgresql://hlbot:hlbotpassword@localhost:5432/hlbot
-npm run migrate
-npm run dev
+npm install
+cp .env.example .env          # tweak OWNER_TOKEN etc if needed
+docker compose up --build
 ```
+The Postgres container runs every SQL file under `docker/postgres-init/` the first time it creates its data directory, so the schema loads automatically. Docker Compose has healthchecks for every container, so `docker compose ps` will show `(healthy)` once each service responds on `/healthz`.
 
-### Production (bare metal)
+Health endpoints (`http://127.0.0.1:{port}/healthz`):
+
+| Service   | Host Port | Role |
+|-----------|-----------|------|
+| hl-scout  | 4101      | Address admin + candidate publisher |
+| hl-stream | 4102      | Watchlist WS + fake fill publisher |
+| hl-sage   | 4103      | Candidate consumer → equal-weight scoring |
+| hl-decide | 4104      | Scores + fills → signals → tickets/outcomes |
+| Postgres  | 5432      | Persistent storage (`hlbot` DB) |
+| NATS      | 4222      | Bus (`a/b/c/d.*.v1`) |
+
+### API docs / Swagger
+| Service | UI URL | Notes |
+|---------|--------|-------|
+| hl-scout | http://localhost:4101/docs | Swagger UI for address + admin endpoints (set `x-owner-key`). |
+| hl-stream | http://localhost:4102/docs | Swagger UI documenting watchlist + `/ws`. |
+| hl-sage | http://localhost:4103/docs | FastAPI interactive docs (candidates/scores). |
+| hl-decide | http://localhost:4104/docs | FastAPI interactive docs (signals/outcomes). |
+| Ops dashboard | http://localhost:4102/dashboard | Live TradingView chart, address stats, fills, and decision feed. |
+
+### End-to-end smoke
 ```bash
-npm run build
-STORAGE_BACKEND=postgres DATABASE_URL=postgresql://... npm run migrate
-PORT=3000 node dist/server.js
+npm run e2e-smoke          # Seeds → waits for d.outcomes.v1 → prints trace
 ```
 
-### Docker
+### Local dev
+
+- `npm run dev:scout` / `npm run dev:stream` for the TS services.
+- Python services can be run with `uvicorn services.hl-sage.app.main:app --reload --port 4103` etc (ensure NATS + Postgres running).
+
+## Message Contracts
+Schemas live under `contracts/jsonschema`. `scripts/generate-contracts.mjs` emits:
+
+| Topic            | Schema (zod/pydantic)  | Publisher → Consumer |
+|------------------|------------------------|----------------------|
+| `a.candidates.v1`| `CandidateEvent`       | hl-scout → hl-sage   |
+| `b.scores.v1`    | `ScoreEvent`           | hl-sage → hl-decide  |
+| `c.fills.v1`     | `FillEvent`            | hl-stream → hl-decide |
+| `d.signals.v1`   | `SignalEvent`          | hl-decide → (persist) |
+| `d.outcomes.v1`  | `OutcomeEvent`         | hl-decide → (persist) |
+
+Run `npm run contracts:generate` to refresh bindings (automatically wired as `prebuild`).
+
+## Database
+
+When the Postgres container receives a fresh data directory it automatically executes every `.sql` file in `docker/postgres-init/` in alphabetical order. These scripts create all shared tables (`addresses`, `hl_events`, `hl_current_positions`, `marks_1m`, `tickets`, `ticket_outcomes`, `hl_leaderboard_entries`, `sage_tracked_addresses`, `decide_scores`, `decide_fills`, …) and performance indexes, so you do **not** need to run any manual migrations. To reset the schema, run `docker compose down -v` and bring the stack back up—Postgres will reapply the full schema during initialization.
+
+**Note**: Init scripts only run on first container creation. To apply new schema changes to an existing database:
+
 ```bash
-cp .env.example .env   # adjust values
-docker compose up -d --build
-open http://localhost:3000
+# Apply a specific migration
+docker compose exec postgres psql -U hlbot -d hlbot -f /docker-entrypoint-initdb.d/008_add_hl_events_indexes.sql
+
+# Or reset everything (drops all data)
+docker compose down -v && docker compose up --build
 ```
-Common admin:
+
+## Environment
+
+Key variables (see `.env.example`):
+
+| Var              | Default                          | Description |
+|------------------|----------------------------------|-------------|
+| `OWNER_TOKEN`    | `dev-owner`                      | Shared HTTP auth (header `x-owner-key`) |
+| `NATS_URL`       | `nats://nats:4222`               | NATS connection string |
+| `DATABASE_URL`   | `postgresql://hlbot:...@postgres`| Postgres DSN |
+| `SCOUT_SEEDS`    | 3 demo 0x addresses              | Initial candidates emitted on boot |
+| `SCOUT_URL`      | `http://hl-scout:8080`           | Used by hl-stream to refresh watchlist |
+| `LEADERBOARD_API_URL` | `https://...` | Leaderboard API URL |
+| `LEADERBOARD_TOP_N` | `1000` | Number of leaderboard entries fetched per period |
+| `LEADERBOARD_SELECT_COUNT` | `12` | Auto-tracked addresses pushed to hl-stream/hl-sage |
+| `LEADERBOARD_PERIODS` | `30` | Leaderboard period (days) to track |
+| `LEADERBOARD_REFRESH_MS` | `86400000` | Crawl cadence (ms) |
+| `LEADERBOARD_SORT` | `3` | Sort order: 0=WinRate, 1=AccountValue, 3=PnL, 4=Trades, 5=ProfitableTrades, 6=LastOp, 7=AvgHold, 8=Positions |
+| `LEADERBOARD_ENRICH_COUNT` | `12` | How many ranked wallets to enrich with stats + curves per refresh |
+| `LEADERBOARD_STATS_CONCURRENCY` | `4` | Parallel leaderboard detail requests |
+| `LEADERBOARD_SERIES_CONCURRENCY` | `2` | Parallel Hyperliquid `portfolio` requests |
+| `*_PORT`         | `410{1-4}`                       | Host-forwarded HTTP ports |
+
+Compose keeps everything on an isolated bridge network and only binds owner HTTP ports to `127.0.0.1`.
+
+### Clean rebuild / restart
+
+When you want to wipe everything and start from scratch:
+
 ```bash
-docker compose logs -f app
-docker compose down            # stop keep volumes
-docker compose down -v         # stop + wipe data
-docker compose build --no-cache && docker compose up -d --force-recreate  # force rebuild
+docker compose down -v          # stop services and drop volumes
+npm install                     # ensure deps are up to date
+npm run build                   # compile TS services
+docker compose up --build -d    # rebuild and restart the stack
 ```
 
-## Features
+Once `docker compose ps` shows each service as `(healthy)`, the platform is ready. If you need the demo addresses back after nuking Postgres, call `POST /admin/seed` on hl-scout with your owner token.
 
-- Track multiple addresses (nickname support) and view consolidated BTC perp fills & positions.
-- Real‑time WebSocket stream (`/ws`) for incremental trade & position events (adaptive broadcast + heartbeat).
-- Time‑based trade pagination (cursor `beforeAt`) with infinite scroll & skeleton loaders.
-- Fast in‑memory event queue + durable Postgres storage (`hl_events`, `hl_current_positions`).
-- One‑click Refresh All (clear DB + backfill) & Clear (purge only) actions.
-- Accessible UI: relative/absolute time toggle, toast notifications, focus styles.
-- Deduplication by (time,id) client side; hash stored for future refinement.
-- DB indexes for chronological queries (global + per address).
+## Tooling
 
-## Data & Storage
+| Script                 | Purpose |
+|------------------------|---------|
+| `npm run build`        | TypeScript project references + `tsc-alias` |
+| `npm run dev:scout`    | Watch mode for hl-scout |
+| `npm run dev:stream`   | Watch mode for hl-stream |
+| `npm run contracts:generate` | Rebuild zod/pydantic bindings |
+| `npm run e2e-smoke`    | Seed + wait for Candidate→Outcome flow |
+| `npm run docker:rebuild` | Full rebuild: stop containers, build fresh images (no cache), start |
+| `npm run docker:up`    | Start all Docker containers |
+| `npm run docker:down`  | Stop all Docker containers |
+| `npm run docker:logs`  | Follow container logs |
+| `npm run docker:ps`    | Show container status |
 
-| Table | Purpose |
-|-------|---------|
-| `hl_events` | Append‑only events (type = 'trade' or 'position' JSON payload) |
-| `hl_current_positions` | Latest snapshot per address (upserted) |
-| `schema_migrations` | Applied migration versions |
+### Docker Commands
 
-### Migrations
-SQL lives in `scripts/migrations/` and is applied lexicographically. Run:
+For quick container management without typing full `docker compose` commands:
+
 ```bash
-npm run migrate
-npm run migrate:status
+npm run docker:rebuild   # Tear down, clean build, restart with latest code
+npm run docker:up        # Start containers
+npm run docker:down      # Stop containers
+npm run docker:logs      # Tail all logs
+npm run docker:ps        # Check status
 ```
-The Docker entrypoint also runs migrations automatically on container start.
 
-## Environment Variables
-
-| Var | Default | Description |
-|-----|---------|-------------|
-| `PORT` | 3000 | HTTP server port |
-| `STORAGE_BACKEND` | memory | `postgres` | `redis` | `memory` |
-| `DATABASE_URL` / `PG_CONNECTION_STRING` | – | Postgres connection string |
-| `REDIS_URL` | – | Redis connection (optional) |
-| `BACKFILL_ON_START` | false | If `true`, clears & seeds initial recent fills on boot |
-| `IPINFO_INTERVAL_MS` | 600000 | Interval for IP/region refresh (for display only) |
-
-Removed variables: `POLL_INTERVAL_MS` (poller deprecated).
-
-## HTTP API
-
-Addresses / Nicknames:
-- `GET /api/addresses`
-- `POST /api/addresses` `{ address }`
-- `DELETE /api/addresses/:address`
-- `POST /api/addresses/:address/nickname` `{ nickname } | { nickname: "" }` (clear)
-
-Positions & Price:
-- `GET /api/current-positions` – consolidated latest positions
-- `GET /api/positions/:address` – on‑demand position snapshot
-- `GET /api/price` – current BTC price snapshot
-
-Trades:
-- `GET /api/latest-trades?limit=200&beforeAt=<ISO>&beforeId=<int>&address=<0x...>` → `{ trades, nextCursor }`
-- `GET /api/user-trades/:address` – recent fills direct from Info API (not paginated)
-- `POST /api/backfill` `{ address?: string|null, limit?: number }` – light recent fills ingestion
-- `POST /api/clear-all-trades` – destructive wipe of all stored trades
-- `POST /api/clear-and-backfill-all` – wipe then backfill recent fills for each tracked address
-
-Realtime (HTTP Pull):
-- `GET /api/changes?since=<seq>&limit=<n>` – incremental events (used mainly for fallback/debug)
-
-Static UI:
-- `GET /` – main interface (module script + realtime)
-
-Deprecated/Removed: `/api/recommendations`, `/api/poll-now`, `/api/cleanup-and-backfill`.
-
-## WebSocket API (`/ws`)
-
-Client connects → server sends:
-```json
-{ "type": "hello", "latestSeq": 1234 }
+The `docker:rebuild` command is useful when you want to ensure all containers are rebuilt from scratch with your latest code changes. It runs:
+```bash
+docker compose down && docker compose build --no-cache && docker compose up -d
 ```
-Client may request backlog:
-```json
-{ "since": 1200 }
-```
-Server pushes either incremental batches:
-```json
-{ "type": "events", "events": [ ... ] }
-```
-or initial catch-up:
-```json
-{ "type": "batch", "events": [ ... ] }
-```
-Event shapes:
-```
-position: {
-  type: 'position', seq, at, address, symbol: 'BTC',
-  size, side, entryPriceUsd, liquidationPriceUsd, leverage, pnlUsd
-}
-trade: {
-  type: 'trade', seq, at, address, symbol: 'BTC', side: 'buy'|'sell',
-  direction: 'long'|'short'|'flat', effect: 'open'|'close', priceUsd,
-  size, realizedPnlUsd?, startPosition?, fee?, feeToken?, hash?, action?
-}
-```
-Heartbeat: server pings every 30s; unresponsive clients are terminated.
-Adaptive broadcast interval: 1000ms (≤10 clients), 500ms (≤25), 250ms (>25).
 
-## Pagination Strategy
-Trades are ordered by `at desc, id desc`. Cursor = `{ beforeAt, beforeId }` from the last trade in a page. Supplying both ensures that fills sharing the exact same millisecond timestamp remain reachable while still preventing misordering that pure id-based pagination can introduce.
+## Service Notes
 
-## Refresh & Clear Workflow
-UI buttons:
-- **Refresh All** → POST `/api/clear-and-backfill-all` then reload first page (fresh consistent base).
-- **Clear** → POST `/api/clear-all-trades` (DB wipe only). Real‑time WS will then show only new incoming fills.
-Infinite scroll fetches older pages (200/page) as sentinel enters viewport; rate limited client side.
+### hl-scout (TS)
+- Express API for addresses (`GET/POST/DELETE /addresses`).
+- `POST /admin/seed` & `/admin/backfill/:address` require `x-owner-key`.
+- Crawls the Hyperliquid leaderboard on a schedule (30-day period, top-N), scoring entries by win rate, PnL efficiency, and pnlList consistency, then publishes `a.candidates.v1` with weights/metadata.
+- On startup, automatically seeds the leaderboard if no entries exist.
+- Reuses Hyperliquid info/backfill helpers to warm Postgres (`hl_events`).  
+- Swagger UI at http://localhost:4101/docs.
+
+### hl-stream (TS)
+- Pulls the weighted leaderboard selection from hl-scout and mirrors those addresses' Hyperliquid realtime feeds.
+- Exposes `/ws` with the legacy event queue semantics.
+- Emits authentic BTC/ETH fills for tracked addresses → `c.fills.v1` + WS broadcast.
+- Swagger UI at http://localhost:4102/docs.
+- Serves the operator dashboard at `/dashboard` with:
+  - Real-time position tracking with status polling
+  - Infinite scroll fills history with aggregation
+  - Historical fills backfill from Hyperliquid API
+  - Links to [Hypurrscan](https://hypurrscan.io) for address details
+
+### hl-sage (Py/FastAPI)
+- Subscribes to `a.candidates.v1`, computes deterministic equal weights, emits `b.scores.v1`.
+- `GET /ranks/top?n=20` returns best candidates.
+- `/metrics` exposes Prometheus counters/histograms.
+- FastAPI docs at http://localhost:4103/docs.
+
+### hl-decide (Py/FastAPI)
+- Consumes `b.scores.v1` + `c.fills.v1`, emits `d.signals.v1` with naive majority.
+- Persists tickets & time-boxed outcomes in Postgres; publishes `d.outcomes.v1`.
+- FastAPI docs at http://localhost:4104/docs.
+
+### Operator Dashboard
+Open http://localhost:4102/dashboard to monitor the stack:
+
+- **TradingView Chart**: BTC/ETH toggle with official TradingView widget
+- **Top Performance Table**: Win rate, trades, efficiency, realized PnL, live BTC/ETH holdings
+- **Live Fills Feed**:
+  - Real-time BTC/ETH fills streamed via WebSocket
+  - Fill aggregation (groups trades within 1-minute windows)
+  - Infinite scroll with pagination for historical data
+  - "Load Historical Fills" button to backfill from Hyperliquid API
+  - Time range indicator showing oldest to newest fill
+- **Decision Panel**: Tickets + outcomes with recommendation card
+- **Custom Accounts**: Track up to 3 custom addresses alongside system-selected ones
+- **Position Status**: Automatic polling until positions are loaded (max 60s timeout)
+
+## Leaderboard Ingest
+
+`hl-scout` crawls the Hyperliquid leaderboard for the 30-day period. For every refresh it:
+
+1. Fetches the top `LEADERBOARD_TOP_N` addresses sorted by realized PnL.
+2. Computes derived metrics (win rate safety, trade efficiency, realized PnL, pnlList consistency) and scores each wallet.
+3. Enriches the top `LEADERBOARD_ENRICH_COUNT` entries with Hyperliquid leaderboard details and `portfolio` data, storing stats on `hl_leaderboard_entries` and time-series in `hl_leaderboard_pnl_points`.
+4. Persists the scored rows to `hl_leaderboard_entries`, exposes them via `/leaderboard`/`/leaderboard/selected`, and emits `a.candidates.v1` events with weights + metadata.
+
+`hl-stream` consumes the selected list (default 12 addresses) to drive realtime Hyperliquid subscriptions, while `hl-sage` combines the weights with live fills and inferred positions to publish `b.scores.v1` follow signals.
 
 ## Development Tips
-Run tests:
-```bash
-npm test
+
+- Contracts are generated; do not edit `contracts/ts/index.ts` or `contracts/py/models.py` manually.
+- Shared TypeScript helpers live in `packages/ts-lib` (NATS wrapper, metrics, address store, Hyperliquid client, etc.).
+- `scripts/phase1-plan.md` documents the intent/scope for this phase.
+
+## Recent Improvements (November 2025)
+
+A comprehensive code review identified and fixed 20 issues across critical security, performance, and code quality areas:
+
+### Security & Stability
+- ✅ **SQL Injection Protection**: All queries now use parameterized statements
+- ✅ **Input Validation**: New validation module for Ethereum addresses with format checking
+- ✅ **Transaction Safety**: Leaderboard updates wrapped in database transactions (prevents data loss)
+- ✅ **Error Handling**: Comprehensive error logging throughout all services
+- ✅ **Python datetime fix**: Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)`
+
+### Performance Optimizations
+- ✅ **Database Indexes**: Added strategic indexes for faster queries (trades, positions, leaderboard)
+- ✅ **Memory Management**: Python services now use LRU caching with configurable limits
+- ✅ **WebSocket Cleanup**: Fixed memory leaks with proper interval and connection management
+- ✅ **Query Optimization**: Removed code duplication in pagination functions
+
+### Code Quality
+- ✅ **Type Safety**: Replaced `any` types with `Record<string, unknown>` for better compile-time safety
+- ✅ **Promise Handling**: All background promises now have proper error handlers
+- ✅ **Configuration**: Added environment variables for memory limits in Python services
+
+### Dashboard & API Enhancements
+- ✅ **ETH Support**: Now tracks both BTC and ETH perpetual fills (not just BTC)
+- ✅ **Fill Aggregation**: Groups multiple fills within 1-minute windows for cleaner display
+- ✅ **Infinite Scroll**: Paginated fills with automatic loading on scroll
+- ✅ **Historical Backfill**: Fetch historical fills from Hyperliquid API on demand
+- ✅ **Position Polling**: Dashboard polls for position readiness with 60s timeout
+- ✅ **External Links**: Address links now point to Hypurrscan for detailed on-chain info
+
+See [CODE_REVIEW_FIXES.md](docs/CODE_REVIEW_FIXES.md) for detailed technical documentation.
+
+### New Environment Variables
+
+Python services now support memory management configuration:
+
+```env
+# hl-sage memory limits
+MAX_TRACKED_ADDRESSES=1000   # Default: 1000
+MAX_SCORES=500               # Default: 500
+STALE_THRESHOLD_HOURS=24     # Default: 24
+
+# hl-decide memory limits
+MAX_FILLS=500                # Default: 500
 ```
-Type checking / build:
+
+### Testing
+
+Run the full test suite including new validation tests:
+
 ```bash
-npm run build
+npm test                      # All tests
+npm run test:coverage         # With coverage report
+npm test -- validation        # Just validation tests
 ```
 
-## FAQ
-
-### I don't see new UI changes (e.g., Refresh All / Clear buttons)
-1. Confirm you are on the correct branch: `git branch --show-current`.
-2. Commit/merge local changes if they are still unstaged.
-3. Force a Docker rebuild:
-   ```bash
-   docker compose build --no-cache
-   docker compose up -d --force-recreate
-   ```
-4. Hard refresh browser: open DevTools → Network tab → check “Disable cache” → Shift+Reload.
-5. Ensure no service worker is intercepting (DevTools > Application).
-
-### WebSocket not updating
-- Check Network → WS frames; ensure connection to `/ws` upgrades.
-- Confirm server logs show WebSocket connections.
-- Firewall / corporate proxy can block WS; test with `wscat` or `curl -v` to see 101 upgrade.
-
-### Pagination stopped loading
-- If sentinel shows *"No more fills"* you reached oldest stored record.
-- If it shows an error: network transient – scroll again (rate limiter 800ms).
-
-### How do I completely reset trade data?
-Use **Clear** (UI) or:
-```bash
-curl -X POST http://localhost:3000/api/clear-all-trades
-```
-Then optionally run Refresh All for a fresh backfill.
-
-### DB migration errors
-- Verify `DATABASE_URL` matches running Postgres.
-- Run migrations manually: `npm run migrate` and inspect output.
-- If a partial migration applied, fix the SQL then re-run; idempotent `CREATE INDEX IF NOT EXISTS` patterns are used.
-
-### How is dedup handled?
-Server: inserts skip when an existing trade with same `hash` for address exists. Client: merges by composite key `id|time` for stable sort.
-
-### Can I extend events with new fields?
-Yes – append to the trade payload & update the `ChangeEvent` union (see `src/queue.ts`). Frontend consumes unknown fields gracefully (ignored unless rendered).
-
-### Why time + id ordering?
-Ensures deterministic chronology even when two trades share identical millisecond timestamps; `id` breaks ties for stable, repeatable pagination.
-
-### Hard / Force Refresh Summary
-| Operation | Action |
-|-----------|--------|
-| Browser hard reload | Shift + Reload (or Cmd+Shift+R) |
-| Disable cache (dev) | DevTools > Network > Disable cache |
-| Force rebuild images | `docker compose build --no-cache` |
-| Force recreate containers | `docker compose up -d --force-recreate` |
-| Purge trade data | POST `/api/clear-all-trades` |
-| Clear & reseed trades | POST `/api/clear-and-backfill-all` |
-
-## Roadmap (Potential)
-- Client hash-based dedup (instead of id|time) for WS preview rows.
-- Position change flashing / diff highlighting.
-- Persistent user display preferences (time mode, column order).
-- Compression or delta packing for high-volume WS scenarios.
-
----
-Feel free to open issues or adapt for multi-tenant use; current design assumes a controlled address list and moderate real-time event volume.
+## License
+PolyForm Noncommercial 1.0.0 – free for personal/non-commercial use. For commercial licensing, please reach out.

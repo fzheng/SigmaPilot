@@ -1,4 +1,4 @@
-import { mergeTrades, TradeRow, canLoadMore, RateState } from '../src/pagination';
+import { mergeTrades, TradeRow, canLoadMore, RateState } from '../packages/ts-lib/src/pagination';
 
 describe('mergeTrades', () => {
   const base: TradeRow[] = [

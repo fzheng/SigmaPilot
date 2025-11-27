@@ -3,12 +3,30 @@ const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
 
+// Load .env file manually (since we don't have dotenv as a dependency)
+function loadEnvFile() {
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf8');
+    envContent.split('\n').forEach(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return;
+      const match = trimmed.match(/^([^=]+)=(.*)$/);
+      if (match && !process.env[match[1]]) {
+        process.env[match[1]] = match[2];
+      }
+    });
+  }
+}
+
+loadEnvFile();
+
 function getDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
   const host = process.env.PGHOST || 'localhost';
   const port = process.env.PGPORT || '5432';
   const user = process.env.PGUSER || process.env.POSTGRES_USER || 'postgres';
-  const password = process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD || '';
+  const password = process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD;
   const database = process.env.PGDATABASE || process.env.POSTGRES_DB || 'postgres';
   let auth = user;
   if (password) auth += `:${encodeURIComponent(password)}`;
@@ -16,10 +34,10 @@ function getDatabaseUrl() {
 }
 
 function getMigrationsDir() {
-  // Default directory moved from root 'migrations' to 'scripts/migrations'
+  // Default directory moved to /db/migrations for monorepo
   // Set MIGRATIONS_DIR to override if needed.
   return process.env.MIGRATIONS_DIR
-    || path.resolve(process.cwd(), 'scripts', 'migrations');
+    || path.resolve(process.cwd(), 'db', 'migrations');
 }
 
 function getMigrationsList(dir) {
