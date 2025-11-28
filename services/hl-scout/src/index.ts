@@ -525,12 +525,19 @@ async function main() {
       profiles[entry.address] = entry.profile;
     }
 
-    // Get holdings for all accounts (BTC and ETH positions)
-    const holdings: Record<string, Array<{ symbol: string; size: number }>> = {};
+    // Get holdings for all accounts (BTC and ETH positions) with entry and liquidation prices
+    const holdings: Record<string, Array<{
+      symbol: string;
+      size: number;
+      entryPrice: number | null;
+      liquidationPrice: number | null;
+      leverage: number | null;
+    }>> = {};
     if (allEntries.length) {
       const pool = await getPool();
       const { rows } = await pool.query(
-        `select address, symbol, size from hl_current_positions
+        `select address, symbol, size, entry_price, liquidation_price, leverage
+         from hl_current_positions
          where lower(address) = any($1)
          and symbol in ('BTC', 'ETH')
          and abs(size) >= 0.0001
@@ -544,6 +551,9 @@ async function main() {
         holdings[addr].push({
           symbol: String(row.symbol || 'BTC').toUpperCase(),
           size: Number(row.size || 0),
+          entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
+          liquidationPrice: row.liquidation_price != null ? Number(row.liquidation_price) : null,
+          leverage: row.leverage != null ? Number(row.leverage) : null,
         });
       }
     }

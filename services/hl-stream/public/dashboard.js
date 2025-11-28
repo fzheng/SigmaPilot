@@ -42,11 +42,12 @@ themeButtons.forEach(btn => {
   });
 });
 
-const statusEl = document.getElementById('dashboard-status');
+// Status element removed - using live clock instead
+const statusEl = null;
 const addressTable = document.getElementById('address-table');
 const fillsTable = document.getElementById('fills-table');
-const decisionsList = document.getElementById('decisions-list');
-const recommendationCard = document.getElementById('recommendation-card');
+const aiRecommendationsTable = document.getElementById('ai-recommendations-table');
+const aiStatusEl = document.getElementById('ai-status');
 const symbolButtons = document.querySelectorAll('.toggle-group button');
 const lastRefreshEl = document.getElementById('last-refresh');
 const refreshBtn = document.getElementById('refresh-btn');
@@ -66,6 +67,32 @@ let customAccountCount = 0;
 const MAX_CUSTOM_ACCOUNTS = 3;
 let positionsReady = false; // Track whether positions have been loaded
 
+// Price ticker state
+let lastBtcPrice = null;
+let lastEthPrice = null;
+const btcPriceEl = document.getElementById('btc-price');
+const ethPriceEl = document.getElementById('eth-price');
+const btcPriceItem = document.getElementById('btc-price-item');
+
+// Live clock
+const liveClockEl = document.getElementById('live-clock');
+
+function updateLiveClock() {
+  if (!liveClockEl) return;
+  const now = new Date();
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  // Use spans for separators to enable blinking animation
+  liveClockEl.innerHTML = `${hours}<span class="clock-separator">:</span>${minutes}<span class="clock-separator">:</span>${seconds}`;
+}
+
+// Start clock immediately and update every second
+updateLiveClock();
+setInterval(updateLiveClock, 1000);
+
+const ethPriceItem = document.getElementById('eth-price-item');
+
 // Fills time range tracking
 let fillsOldestTime = null;
 let fillsNewestTime = null;
@@ -74,9 +101,224 @@ let hasMoreFills = true;
 
 // Fill aggregation settings
 const AGGREGATION_WINDOW_MS = 60000; // 1 minute
+const MAX_AGGREGATED_GROUPS = 50; // Max number of aggregated groups to keep
+
+// Streaming aggregation state - stores pre-aggregated groups
+let aggregatedGroups = [];
+
+// Create a new aggregation group from a single fill
+function createGroup(fill) {
+  const symbol = (fill.symbol || 'BTC').toUpperCase();
+  return {
+    id: `${fill.address}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
+    time_utc: fill.time_utc,
+    oldest_time: fill.time_utc,
+    address: fill.address,
+    symbol: symbol,
+    action: fill.action || '',
+    fills: [fill],
+    totalSize: Math.abs(fill.size_signed || 0),
+    totalPnl: fill.closed_pnl_usd || 0,
+    prices: fill.price_usd ? [fill.price_usd] : [],
+    previous_position: fill.previous_position,
+    isAggregated: false,
+    fillCount: 1,
+    avgPrice: fill.price_usd || null,
+    size_signed: fill.size_signed,
+    closed_pnl_usd: fill.closed_pnl_usd,
+    price_usd: fill.price_usd,
+  };
+}
+
+// Check if a fill can be merged into an existing group
+function canMergeIntoGroup(group, fill) {
+  const fillTime = new Date(fill.time_utc).getTime();
+  const groupNewestTime = new Date(group.time_utc).getTime();
+  const groupOldestTime = new Date(group.oldest_time).getTime();
+
+  // Check if fill is within the aggregation window of the group
+  const timeDiffFromNewest = Math.abs(groupNewestTime - fillTime);
+  const timeDiffFromOldest = Math.abs(groupOldestTime - fillTime);
+  const withinWindow = timeDiffFromNewest <= AGGREGATION_WINDOW_MS || timeDiffFromOldest <= AGGREGATION_WINDOW_MS;
+
+  const symbol = (fill.symbol || 'BTC').toUpperCase();
+  const sameAddress = group.address === fill.address;
+  const sameSymbol = group.symbol === symbol;
+  const sameAction = group.action === (fill.action || '');
+
+  return sameAddress && sameSymbol && sameAction && withinWindow;
+}
+
+// Merge a fill into an existing group
+function mergeIntoGroup(group, fill) {
+  const fillTime = new Date(fill.time_utc).getTime();
+
+  group.fills.push(fill);
+  group.totalSize += Math.abs(fill.size_signed || 0);
+  group.totalPnl += fill.closed_pnl_usd || 0;
+  if (fill.price_usd) {
+    group.prices.push(fill.price_usd);
+  }
+
+  // Update time range
+  if (fillTime > new Date(group.time_utc).getTime()) {
+    group.time_utc = fill.time_utc;
+  }
+  if (fillTime < new Date(group.oldest_time).getTime()) {
+    group.oldest_time = fill.time_utc;
+  }
+
+  // Update previous_position - use largest absolute value (true starting position)
+  const fillPrev = fill.previous_position;
+  const groupPrev = group.previous_position;
+  if (fillPrev != null && (groupPrev == null || Math.abs(fillPrev) > Math.abs(groupPrev))) {
+    group.previous_position = fillPrev;
+  }
+
+  // Update computed fields
+  group.fillCount = group.fills.length;
+  group.isAggregated = group.fills.length > 1;
+  group.avgPrice = group.prices.length > 0
+    ? group.prices.reduce((a, b) => a + b, 0) / group.prices.length
+    : null;
+
+  // Update signed size based on action
+  const isShort = group.action.toLowerCase().includes('short');
+  const isDecrease = group.action.toLowerCase().includes('decrease') || group.action.toLowerCase().includes('close');
+  group.size_signed = isShort || isDecrease ? -group.totalSize : group.totalSize;
+  group.closed_pnl_usd = group.totalPnl || null;
+  group.price_usd = group.avgPrice;
+}
+
+// Add a new fill to the streaming aggregation
+function addFillToAggregation(fill) {
+  const symbol = (fill.symbol || 'BTC').toUpperCase();
+  // Only process BTC and ETH
+  if (symbol !== 'BTC' && symbol !== 'ETH') return;
+
+  // Try to merge with existing groups (check recent groups within time window)
+  let merged = false;
+  for (let i = 0; i < aggregatedGroups.length; i++) {
+    const group = aggregatedGroups[i];
+
+    // Only check groups that could potentially match (within 2x window for safety)
+    const groupTime = new Date(group.time_utc).getTime();
+    const fillTime = new Date(fill.time_utc).getTime();
+    if (Math.abs(groupTime - fillTime) > AGGREGATION_WINDOW_MS * 2) {
+      // Groups are sorted by time, so if we're past the window, stop checking
+      if (fillTime > groupTime) continue;
+      break;
+    }
+
+    if (canMergeIntoGroup(group, fill)) {
+      mergeIntoGroup(group, fill);
+      merged = true;
+      break;
+    }
+  }
+
+  // If not merged, create a new group
+  if (!merged) {
+    const newGroup = createGroup(fill);
+    aggregatedGroups.unshift(newGroup);
+  }
+
+  // Sort groups by newest time (descending)
+  aggregatedGroups.sort((a, b) => new Date(b.time_utc) - new Date(a.time_utc));
+
+  // Trim to max size
+  if (aggregatedGroups.length > MAX_AGGREGATED_GROUPS) {
+    aggregatedGroups = aggregatedGroups.slice(0, MAX_AGGREGATED_GROUPS);
+  }
+
+  // Update time range tracking
+  updateAggregatedTimeRange();
+}
+
+// Initialize aggregation from a batch of fills (e.g., initial load)
+function initializeAggregation(fills) {
+  // Filter to BTC/ETH only
+  const btcEthFills = fills.filter(fill => {
+    const symbol = (fill.symbol || 'BTC').toUpperCase();
+    return symbol === 'BTC' || symbol === 'ETH';
+  });
+
+  // Use the existing batch aggregation for initial load
+  aggregatedGroups = aggregateFills(btcEthFills);
+
+  // Trim to max size
+  if (aggregatedGroups.length > MAX_AGGREGATED_GROUPS) {
+    aggregatedGroups = aggregatedGroups.slice(0, MAX_AGGREGATED_GROUPS);
+  }
+
+  // Update time range
+  updateAggregatedTimeRange();
+}
+
+// Update time range from aggregated groups
+function updateAggregatedTimeRange() {
+  if (aggregatedGroups.length === 0) {
+    fillsNewestTime = null;
+    fillsOldestTime = null;
+  } else {
+    // Newest is from first group's time_utc
+    fillsNewestTime = aggregatedGroups[0].time_utc;
+    // Oldest is from last group's oldest_time
+    fillsOldestTime = aggregatedGroups[aggregatedGroups.length - 1].oldest_time;
+  }
+  updateTimeRangeDisplay();
+}
 
 function placeholder(text = 'No live data') {
   return `<span class="placeholder">${text}</span>`;
+}
+
+// Format price for display (e.g., $97,234.56)
+function fmtPrice(value) {
+  if (!Number.isFinite(value)) return '—';
+  return '$' + value.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+// Update price ticker display
+function updatePriceTicker(btc, eth) {
+  if (btcPriceEl && Number.isFinite(btc)) {
+    const prevBtc = lastBtcPrice;
+    btcPriceEl.textContent = fmtPrice(btc);
+
+    // Flash animation on price change
+    if (prevBtc !== null && btc !== prevBtc) {
+      btcPriceItem?.classList.remove('flash-up', 'flash-down');
+      void btcPriceItem?.offsetWidth; // Trigger reflow
+      btcPriceItem?.classList.add(btc > prevBtc ? 'flash-up' : 'flash-down');
+    }
+    lastBtcPrice = btc;
+  }
+
+  if (ethPriceEl && Number.isFinite(eth)) {
+    const prevEth = lastEthPrice;
+    ethPriceEl.textContent = fmtPrice(eth);
+
+    // Flash animation on price change
+    if (prevEth !== null && eth !== prevEth) {
+      ethPriceItem?.classList.remove('flash-up', 'flash-down');
+      void ethPriceItem?.offsetWidth; // Trigger reflow
+      ethPriceItem?.classList.add(eth > prevEth ? 'flash-up' : 'flash-down');
+    }
+    lastEthPrice = eth;
+  }
+}
+
+// Fetch initial prices
+async function fetchPrices() {
+  try {
+    const data = await fetchJson(`${API_BASE}/prices`);
+    updatePriceTicker(data.btc, data.eth);
+  } catch (err) {
+    console.error('Failed to fetch prices:', err);
+  }
 }
 
 function fmtPercent(value) {
@@ -121,7 +363,21 @@ function formatHolding(entry) {
   const magnitude = Math.abs(size);
   const precision = magnitude >= 1 ? 2 : 3;
   const signed = `${size >= 0 ? '+' : '-'}${magnitude.toFixed(precision)} ${symbol || ''}`.trim();
-  return `<span class="holding-chip ${direction}" title="Live Hyperliquid position">${signed}</span>`;
+
+  // Build tooltip with entry and liquidation prices
+  const tooltipParts = [];
+  if (entry.entryPrice != null && Number.isFinite(entry.entryPrice)) {
+    tooltipParts.push(`Entry: $${entry.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  }
+  if (entry.liquidationPrice != null && Number.isFinite(entry.liquidationPrice)) {
+    tooltipParts.push(`Liq: $${entry.liquidationPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  }
+  if (entry.leverage != null && Number.isFinite(entry.leverage)) {
+    tooltipParts.push(`${entry.leverage}x`);
+  }
+  const tooltip = tooltipParts.length > 0 ? tooltipParts.join(' | ') : 'Live position';
+
+  return `<span class="holding-chip ${direction}" title="${tooltip}">${signed}</span>`;
 }
 
 function normalizeHoldings(raw = {}) {
@@ -134,12 +390,18 @@ function normalizeHoldings(raw = {}) {
       normalized[key] = positions.map(pos => ({
         symbol: (pos?.symbol || '').toUpperCase(),
         size: Number(pos?.size ?? 0),
+        entryPrice: pos?.entryPrice ?? null,
+        liquidationPrice: pos?.liquidationPrice ?? null,
+        leverage: pos?.leverage ?? null,
       }));
     } else {
       // Legacy single position format
       normalized[key] = [{
         symbol: (positions?.symbol || '').toUpperCase(),
         size: Number(positions?.size ?? 0),
+        entryPrice: positions?.entryPrice ?? null,
+        liquidationPrice: positions?.liquidationPrice ?? null,
+        leverage: positions?.leverage ?? null,
       }];
     }
   });
@@ -196,9 +458,18 @@ function aggregateFills(fills) {
         if (fill.price_usd) {
           currentGroup.prices.push(fill.price_usd);
         }
-        // Update time range
+        // Update oldest time
         if (fillTime < new Date(currentGroup.oldest_time).getTime()) {
           currentGroup.oldest_time = fill.time_utc;
+        }
+        // For previous_position, we need the position BEFORE any fills in the group.
+        // When fills are concurrent (same timestamp), they have different previous_position
+        // values representing parallel fills against the order book. The "true" starting
+        // position is the one with the largest absolute value (furthest from zero).
+        const fillPrev = fill.previous_position;
+        const groupPrev = currentGroup.previous_position;
+        if (fillPrev != null && (groupPrev == null || Math.abs(fillPrev) > Math.abs(groupPrev))) {
+          currentGroup.previous_position = fillPrev;
         }
         continue;
       }
@@ -212,6 +483,7 @@ function aggregateFills(fills) {
 
     // Start new group
     currentGroup = {
+      id: `${address}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
       time_utc: fill.time_utc,
       oldest_time: fill.time_utc,
       address: address,
@@ -303,6 +575,45 @@ function fmtScore(score) {
   return score.toFixed(4);
 }
 
+// Generate SVG sparkline from pnlList data
+function generateSparkline(pnlList, width = 80, height = 24) {
+  if (!pnlList || !Array.isArray(pnlList) || pnlList.length < 2) {
+    return '<span class="placeholder">—</span>';
+  }
+
+  // Extract values and normalize
+  const values = pnlList.map(p => parseFloat(p.value) || 0);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+
+  // Generate points for polyline
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * width;
+    const y = height - ((v - min) / range) * (height - 4) - 2; // 2px padding
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  // Determine color based on trend (first vs last value)
+  const startVal = values[0];
+  const endVal = values[values.length - 1];
+  const isPositive = endVal >= startVal;
+  const strokeColor = isPositive ? 'var(--positive)' : 'var(--negative)';
+
+  return `
+    <svg class="sparkline" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+      <polyline
+        points="${points}"
+        fill="none"
+        stroke="${strokeColor}"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+  `;
+}
+
 function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   const rows = (stats || []).slice(0, TOP_TABLE_LIMIT);
   if (!rows.length) {
@@ -311,7 +622,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   }
   addressTable.innerHTML = rows
     .map((row) => {
-      const txCount = profiles[row.address]?.txCount || 0;
+      const scoreValue = typeof row.score === 'number' ? row.score.toFixed(4) : 'N/A';
       const winRateCell = typeof row.winRate === 'number' ? fmtPercent(row.winRate) : placeholder();
       const tradesValue =
         typeof row.statClosedPositions === 'number'
@@ -326,7 +637,11 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
         ? holdingPositions.map(pos => formatHolding(pos)).join(' ')
         : placeholder('No BTC/ETH position');
       const pnlCell = typeof row.realizedPnl === 'number' ? fmtUsdShort(row.realizedPnl) : placeholder();
-      const scoreCell = typeof row.score === 'number' ? fmtScore(row.score) : placeholder();
+
+      // Generate sparkline from pnlList
+      const pnlList = row.meta?.raw?.pnlList || [];
+      const sparklineCell = generateSparkline(pnlList);
+
       const isCustom = row.isCustom === true;
       const customIndicator = isCustom ? '<span class="custom-star" title="Custom tracked account">★</span>' : '';
       const removeBtn = isCustom ? `<button class="remove-custom-btn" data-address="${row.address}" title="Remove custom account">×</button>` : '';
@@ -335,7 +650,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
         : (isCustom ? `<span class="nickname-display nickname-empty" data-address="${row.address}" data-nickname="" title="Click to add nickname">+ Add nickname</span>` : '');
       return `
         <tr class="${isCustom ? 'custom-row' : ''}">
-          <td data-label="Address" title="Hyperliquid tx count: ${txCount}">
+          <td data-label="Address" title="Score: ${scoreValue}">
             <span class="custom-indicator">
               ${customIndicator}
               <a href="https://hypurrscan.io/address/${row.address}" target="_blank" rel="noopener noreferrer">
@@ -351,7 +666,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
             ${holdingCell}
           </td>
           <td data-label="Realized PnL">${pnlCell}</td>
-          <td data-label="Score" class="score-cell">${scoreCell}</td>
+          <td data-label="30D PnL" class="sparkline-cell">${sparklineCell}</td>
         </tr>
       `;
     })
@@ -377,118 +692,165 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   });
 }
 
-function renderRecommendation(summary) {
-  if (!summary?.recommendation) {
-    recommendationCard.innerHTML = '<p>No signal yet.</p>';
-    return;
+// Mock AI recommendations data
+const mockAIRecommendations = [
+  {
+    time: new Date(Date.now() - 2 * 60000).toISOString(),
+    symbol: 'BTC',
+    action: 'LONG',
+    entry: 97250,
+    stopLoss: 96500,
+    takeProfit: 99000,
+    status: 'active'
+  },
+  {
+    time: new Date(Date.now() - 15 * 60000).toISOString(),
+    symbol: 'ETH',
+    action: 'SHORT',
+    entry: 3580,
+    stopLoss: 3650,
+    takeProfit: 3450,
+    status: 'active'
+  },
+  {
+    time: new Date(Date.now() - 45 * 60000).toISOString(),
+    symbol: 'BTC',
+    action: 'LONG',
+    entry: 96800,
+    stopLoss: 96200,
+    takeProfit: 97500,
+    status: 'tp_hit'
+  },
+  {
+    time: new Date(Date.now() - 2 * 3600000).toISOString(),
+    symbol: 'ETH',
+    action: 'LONG',
+    entry: 3520,
+    stopLoss: 3480,
+    takeProfit: 3600,
+    status: 'tp_hit'
+  },
+  {
+    time: new Date(Date.now() - 5 * 3600000).toISOString(),
+    symbol: 'BTC',
+    action: 'SHORT',
+    entry: 97100,
+    stopLoss: 97500,
+    takeProfit: 96200,
+    status: 'sl_hit'
   }
-  const rec = summary.recommendation;
-  const featured = summary.featured;
-  const profile = summary.profiles?.[rec.address];
-  const remark = addressMeta[rec.address?.toLowerCase()]?.remark || '';
-  const winRateText = typeof rec.winRate === 'number' ? fmtPercent(rec.winRate) : 'N/A (no live data)';
-  const realizedText = typeof rec.realizedPnl === 'number' ? fmtUsdShort(rec.realizedPnl) : 'N/A (no live data)';
-  const weightText = typeof rec.weight === 'number' ? `${(rec.weight * 100).toFixed(1)}%` : 'N/A';
-  recommendationCard.innerHTML = `
-    <span>Focus address</span>
-    <strong>${remark ? `${remark} (${shortAddress(rec.address)})` : rec.address}</strong>
-    <span>Win rate: ${winRateText} • Realized: ${realizedText}</span>
-    ${
-      featured
-        ? `<span>Latest fill: ${featured.side.toUpperCase()} ${featured.size} @ ${featured.priceUsd}</span>`
-        : ''
+];
+
+function renderAIRecommendations() {
+  if (!aiRecommendationsTable) return;
+
+  const rows = mockAIRecommendations.map(rec => {
+    const actionClass = rec.action === 'LONG' ? 'buy' : 'sell';
+    let statusClass = '';
+    let statusText = '';
+
+    switch (rec.status) {
+      case 'active':
+        statusClass = 'status-active';
+        statusText = 'Active';
+        break;
+      case 'tp_hit':
+        statusClass = 'status-tp';
+        statusText = 'TP Hit';
+        break;
+      case 'sl_hit':
+        statusClass = 'status-sl';
+        statusText = 'SL Hit';
+        break;
+      case 'expired':
+        statusClass = 'status-expired';
+        statusText = 'Expired';
+        break;
+      default:
+        statusClass = '';
+        statusText = rec.status;
     }
-    <span>Weight: ${weightText}</span>
-    ${profile ? `<span>Total HL transactions: ${profile.txCount || 0}</span>` : ''}
-    <em>${rec.message}</em>
+
+    return `
+      <tr>
+        <td data-label="Time">${fmtTime(rec.time)}</td>
+        <td data-label="Symbol">${rec.symbol}</td>
+        <td data-label="Action"><span class="pill ${actionClass}">${rec.action}</span></td>
+        <td data-label="Entry">${fmtPrice(rec.entry)}</td>
+        <td data-label="SL">${fmtPrice(rec.stopLoss)}</td>
+        <td data-label="TP">${fmtPrice(rec.takeProfit)}</td>
+        <td data-label="Status"><span class="ai-status-badge ${statusClass}">${statusText}</span></td>
+      </tr>
+    `;
+  }).join('');
+
+  aiRecommendationsTable.innerHTML = rows;
+
+  // Update AI status
+  if (aiStatusEl) {
+    const activeCount = mockAIRecommendations.filter(r => r.status === 'active').length;
+    aiStatusEl.innerHTML = `
+      <span class="ai-status-dot"></span>
+      ${activeCount} Active Signal${activeCount !== 1 ? 's' : ''}
+    `;
+  }
+}
+
+// Render a single aggregated group as a table row
+function renderGroupRow(group) {
+  const symbol = (group.symbol || 'BTC').toUpperCase();
+  const sizeVal = group.isAggregated ? group.totalSize : Math.abs(group.size_signed || 0);
+  const sizeSign = group.size_signed >= 0 ? '+' : '-';
+  const size = typeof sizeVal === 'number' ? `${sizeSign}${sizeVal.toFixed(5)} ${symbol}` : '—';
+  const prev = typeof group.previous_position === 'number' ? `${group.previous_position.toFixed(5)} ${symbol}` : '—';
+  const price = group.isAggregated && group.avgPrice
+    ? `~${fmtUsdShort(group.avgPrice)}`
+    : fmtUsdShort(group.price_usd ?? null);
+  const pnl = fmtUsdShort(group.closed_pnl_usd ?? null);
+  const action = group.action || '—';
+  const sideClass = action.toLowerCase().includes('short') ? 'sell' : 'buy';
+
+  // Show aggregation indicator with live update hint
+  const aggBadge = group.isAggregated
+    ? `<span class="agg-badge" title="${group.fillCount} fills aggregated within 1 min">×${group.fillCount}</span>`
+    : '';
+
+  return `
+    <tr class="${group.isAggregated ? 'aggregated-row' : ''}" data-group-id="${group.id || ''}">
+      <td data-label="Time">${fmtDateTime(group.time_utc)}</td>
+      <td data-label="Address"><a href="https://hypurrscan.io/address/${group.address}" target="_blank" rel="noopener noreferrer">${shortAddress(group.address)}</a></td>
+      <td data-label="Action"><span class="pill ${sideClass}">${action}</span>${aggBadge}</td>
+      <td data-label="Size">${size}</td>
+      <td data-label="Previous Position">${prev}</td>
+      <td data-label="Price">${price}</td>
+      <td data-label="Closed PnL">${pnl}</td>
+    </tr>
   `;
 }
 
-function renderFills(list) {
-  // Filter to BTC/ETH only
-  const btcEthFills = list.filter(fill => {
-    const symbol = (fill.symbol || 'BTC').toUpperCase();
-    return symbol === 'BTC' || symbol === 'ETH';
-  });
-
-  // Update time range tracking
-  if (btcEthFills.length > 0) {
-    const times = btcEthFills.map(f => new Date(f.time_utc).getTime()).filter(t => !isNaN(t));
-    if (times.length > 0) {
-      const newestInBatch = new Date(Math.max(...times)).toISOString();
-      const oldestInBatch = new Date(Math.min(...times)).toISOString();
-
-      if (!fillsNewestTime || new Date(newestInBatch) > new Date(fillsNewestTime)) {
-        fillsNewestTime = newestInBatch;
-      }
-      if (!fillsOldestTime || new Date(oldestInBatch) < new Date(fillsOldestTime)) {
-        fillsOldestTime = oldestInBatch;
-      }
-    }
-    updateTimeRangeDisplay();
-  }
-
-  // Aggregate fills
-  const aggregated = aggregateFills(btcEthFills);
-
-  const rows = aggregated
-    .map((fill) => {
-      const symbol = (fill.symbol || 'BTC').toUpperCase();
-      const sizeVal = fill.isAggregated ? fill.totalSize : Math.abs(fill.size_signed || 0);
-      const sizeSign = fill.size_signed >= 0 ? '+' : '-';
-      const size = typeof sizeVal === 'number' ? `${sizeSign}${sizeVal.toFixed(5)} ${symbol}` : '—';
-      const prev = typeof fill.previous_position === 'number' ? `${fill.previous_position.toFixed(5)} ${symbol}` : '—';
-      const price = fill.isAggregated && fill.avgPrice
-        ? `~${fmtUsdShort(fill.avgPrice)}`
-        : fmtUsdShort(fill.price_usd ?? null);
-      const pnl = fmtUsdShort(fill.closed_pnl_usd ?? null);
-      const action = fill.action || '—';
-      const sideClass = action.toLowerCase().includes('short') ? 'sell' : 'buy';
-
-      // Show aggregation indicator
-      const aggBadge = fill.isAggregated
-        ? `<span class="agg-badge" title="${fill.fillCount} fills aggregated">×${fill.fillCount}</span>`
-        : '';
-
-      return `
-        <tr class="${fill.isAggregated ? 'aggregated-row' : ''}">
-          <td data-label="Time">${fmtDateTime(fill.time_utc)}</td>
-          <td data-label="Address"><a href="https://hypurrscan.io/address/${fill.address}" target="_blank" rel="noopener noreferrer">${shortAddress(fill.address)}</a></td>
-          <td data-label="Action"><span class="pill ${sideClass}">${action}</span>${aggBadge}</td>
-          <td data-label="Size">${size}</td>
-          <td data-label="Previous Position">${prev}</td>
-          <td data-label="Price">${price}</td>
-          <td data-label="Closed PnL">${pnl}</td>
-        </tr>
-      `;
-    })
-    .join('');
-
-  fillsTable.innerHTML = rows;
-
-  // Show empty state if no fills
-  if (!fillsTable.innerHTML.trim()) {
+// Render all aggregated groups
+function renderAggregatedFills() {
+  if (aggregatedGroups.length === 0) {
     fillsTable.innerHTML = `<tr><td colspan="7" class="placeholder">No BTC/ETH fills yet</td></tr>`;
+    return;
   }
+
+  const rows = aggregatedGroups.map(group => renderGroupRow(group)).join('');
+  fillsTable.innerHTML = rows;
 
   // Update load history button visibility
   updateLoadHistoryVisibility();
 }
 
-function renderDecisions(list) {
-  decisionsList.innerHTML = list
-    .map(
-      (d) => `
-        <li>
-          <span class="decision-meta"><strong>${d.address}</strong> · ${d.asset} · ${fmtTime(d.ts)}</span>
-          <span class="decision-status ${d.status === 'open' ? 'status-open' : 'status-closed'}">
-            ${d.side.toUpperCase()} ${d.status === 'closed' && d.result != null ? `(${d.result.toFixed(2)})` : ''}
-          </span>
-        </li>
-      `
-    )
-    .join('');
+// Legacy function for initial load - initializes streaming aggregation
+function renderFills(list) {
+  // Initialize the streaming aggregation with the batch
+  initializeAggregation(list);
+
+  // Render the aggregated groups
+  renderAggregatedFills();
 }
+
 
 function updateLastRefreshDisplay(lastRefresh) {
   if (lastRefresh) {
@@ -554,8 +916,6 @@ async function refreshSummary() {
       addressMeta[row.address.toLowerCase()] = { remark: row.remark || null };
     });
     renderAddresses(rows, data.profiles || {}, holdings);
-    renderRecommendation(data);
-    statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
 
     // Update last refresh display
     updateLastRefreshDisplay(data.lastRefresh);
@@ -565,8 +925,7 @@ async function refreshSummary() {
       updateCustomAccountCount(data.customAccountCount, data.maxCustomAccounts || MAX_CUSTOM_ACCOUNTS);
     }
   } catch (err) {
-    statusEl.textContent = 'Failed to load summary';
-    console.error(err);
+    console.error('Failed to load summary:', err);
   }
 }
 
@@ -580,19 +939,17 @@ async function refreshFills() {
   }
 }
 
-async function refreshDecisions() {
-  try {
-    const data = await fetchJson(`${API_BASE}/decisions?limit=20`);
-    renderDecisions(data.decisions || []);
-  } catch (err) {
-    console.error(err);
-  }
-}
 
 function pushFill(fill) {
+  // Keep raw fills cache for potential re-aggregation
   fillsCache.unshift(fill);
-  fillsCache = fillsCache.slice(0, 40);
-  renderFills(fillsCache);
+  fillsCache = fillsCache.slice(0, 200); // Keep more raw fills for history
+
+  // Use streaming aggregation - dynamically merge into existing groups
+  addFillToAggregation(fill);
+
+  // Re-render the aggregated view
+  renderAggregatedFills();
 }
 
 function connectWs() {
@@ -601,6 +958,19 @@ function connectWs() {
   ws.addEventListener('message', (evt) => {
     try {
       const payload = JSON.parse(evt.data);
+
+      // Handle price updates
+      if (payload.type === 'price') {
+        updatePriceTicker(payload.btc, payload.eth);
+        return;
+      }
+
+      // Handle hello message with initial prices
+      if (payload.type === 'hello' && payload.prices) {
+        updatePriceTicker(payload.prices.btc, payload.prices.eth);
+      }
+
+      // Handle trade events
       const events = payload.events || payload.batch || payload;
       if (Array.isArray(events)) {
         events
@@ -671,6 +1041,15 @@ function initChartControls() {
       renderChart(currentSymbol);
     });
   });
+
+  // Chart collapse functionality
+  const collapseBtn = document.getElementById('chart-collapse-btn');
+  const chartCard = document.querySelector('.chart-card');
+  if (collapseBtn && chartCard) {
+    collapseBtn.addEventListener('click', () => {
+      chartCard.classList.toggle('collapsed');
+    });
+  }
 }
 
 // Period controls removed - now fixed to 30 days
@@ -885,16 +1264,13 @@ async function triggerLeaderboardRefresh() {
 
     if (!res.ok) {
       console.error('Refresh error:', data.error);
-      statusEl.textContent = 'Refresh failed';
       return;
     }
 
     // Poll for refresh completion
-    statusEl.textContent = 'Refreshing leaderboard...';
     pollRefreshStatus();
   } catch (err) {
     console.error('Refresh error:', err);
-    statusEl.textContent = 'Refresh failed';
     refreshBtn.disabled = false;
     refreshBtn.classList.remove('loading');
   }
@@ -915,14 +1291,12 @@ async function pollRefreshStatus() {
     refreshBtn.classList.remove('loading');
 
     if (data.status === 'idle') {
-      statusEl.textContent = 'Refresh complete';
       await refreshSummary();
     }
   } catch (err) {
     console.error('Poll refresh status error:', err);
     refreshBtn.disabled = false;
     refreshBtn.classList.remove('loading');
-    statusEl.textContent = 'Refresh status unknown';
   }
 }
 
@@ -1069,11 +1443,13 @@ async function init() {
   initInfiniteScroll();
   initLoadHistoryButton();
   renderChart('BTCUSDT');
+  // Fetch initial prices
+  fetchPrices();
   // Check positions status FIRST before loading data
   await checkPositionsStatus();
   refreshSummary();
   refreshFills();
-  refreshDecisions();
+  renderAIRecommendations();
   connectWs();
   // Continue polling until positions are ready (if not already)
   if (!positionsReady) {
@@ -1081,7 +1457,6 @@ async function init() {
   }
   setInterval(refreshSummary, 30_000);
   setInterval(refreshFills, 20_000);
-  setInterval(refreshDecisions, 45_000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

@@ -24,7 +24,11 @@ import {
   getBackfillFills,
   getOldestFillTime,
   fetchUserFills,
-  insertTradeIfNew
+  insertTradeIfNew,
+  getCurrentPrices,
+  onPriceChange,
+  startPriceFeed,
+  refreshPriceFeed
 } from '@hl/ts-lib';
 
 const OWNER_TOKEN = getOwnerToken();
@@ -198,11 +202,22 @@ function configureWebSocket(server: http.Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
   let pingInterval: NodeJS.Timeout | null = null;
   let broadcastInterval: NodeJS.Timeout | null = null;
+  let priceInterval: NodeJS.Timeout | null = null;
+
+  // Track last sent prices to only send on change
+  let lastBtcPrice: number | null = null;
+  let lastEthPrice: number | null = null;
 
   wss.on('connection', (ws) => {
     const client = { ws, lastSeq: 0, alive: true };
     clients.add(client);
-    ws.send(JSON.stringify({ type: 'hello', latestSeq: queue.latestSeq() }));
+    // Send initial hello with current prices
+    const prices = getCurrentPrices();
+    ws.send(JSON.stringify({
+      type: 'hello',
+      latestSeq: queue.latestSeq(),
+      prices: { btc: prices.btc.price, eth: prices.eth.price }
+    }));
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(String(raw));
@@ -260,12 +275,40 @@ function configureWebSocket(server: http.Server) {
     }
   };
 
+  // Broadcast price updates to all clients
+  const broadcastPrices = () => {
+    if (!clients.size) return;
+    const prices = getCurrentPrices();
+    const btc = prices.btc.price;
+    const eth = prices.eth.price;
+
+    // Only broadcast if prices have changed
+    if (btc === lastBtcPrice && eth === lastEthPrice) return;
+    lastBtcPrice = btc;
+    lastEthPrice = eth;
+
+    const priceMsg = JSON.stringify({ type: 'price', btc, eth });
+    for (const client of clients) {
+      if (client.ws.readyState !== WebSocket.OPEN) {
+        clients.delete(client);
+        continue;
+      }
+      try {
+        client.ws.send(priceMsg);
+      } catch (e) {
+        logger.warn('ws_price_send_failed', { error: e });
+      }
+    }
+  };
+
   broadcastInterval = setInterval(broadcast, 1000);
+  priceInterval = setInterval(broadcastPrices, 2000); // Broadcast prices every 2 seconds
 
   // Cleanup on server shutdown
   process.on('SIGTERM', () => {
     if (pingInterval) clearInterval(pingInterval);
     if (broadcastInterval) clearInterval(broadcastInterval);
+    if (priceInterval) clearInterval(priceInterval);
     wss.close();
   });
 }
@@ -290,6 +333,11 @@ async function main() {
   logger.info('starting_realtime_tracker', { watchlist: watchlist.length });
   await tracker.start({ awaitPositions: true });
   logger.info('realtime_tracker_ready', { watchlist: watchlist.length });
+
+  // Start the price feed for real-time BTC/ETH prices
+  startPriceFeed(async () => watchlist).catch((err) =>
+    logger.warn('price_feed_start_failed', { err: err?.message })
+  );
 
   const app = express();
   app.use(cors());
@@ -324,6 +372,17 @@ async function main() {
     positionsReady: tracker?.positionsReady ?? false,
     watchlistCount: watchlist.length
   }));
+
+  // Real-time prices endpoint
+  app.get('/dashboard/api/prices', (_req, res) => {
+    const prices = getCurrentPrices();
+    res.json({
+      btc: prices.btc.price,
+      eth: prices.eth.price,
+      btcUpdatedAt: prices.btc.updatedAt,
+      ethUpdatedAt: prices.eth.updatedAt
+    });
+  });
 
   // Custom accounts proxy routes
   app.get('/dashboard/api/custom-accounts', (req, res) => proxyScout('/custom-accounts', req, res));
@@ -531,6 +590,7 @@ async function main() {
     try {
       watchlist = await fetchWatchlist();
       await tracker?.refresh();
+      await refreshPriceFeed();
     } catch (err: any) {
       logger.warn('watchlist_poll_failed', { err: err instanceof Error ? err.message : String(err) });
     }
