@@ -50,7 +50,7 @@ npm run dev:stream   # hl-stream in watch mode
 ## Test
 
 ```bash
-npm test             # Run all 504 tests
+npm test             # Run all 681 tests
 npm run test:coverage # With coverage report
 npm run e2e-smoke    # End-to-end smoke test
 ```

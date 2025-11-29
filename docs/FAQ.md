@@ -116,9 +116,9 @@ PostgreSQL stores all data in a Docker volume. Key tables:
 - `hl_leaderboard_entries` - Trader rankings
 - `hl_custom_accounts` - User's custom tracked accounts
 
-### Why is leaderboard.ts coverage low?
+### Why is leaderboard.ts coverage not 100%?
 
-The leaderboard service makes many external API calls which are mocked in tests. The unit tests focus on scoring logic. Integration tests with real APIs are not run in CI to avoid rate limits.
+The leaderboard service (1600+ lines) makes many external API calls to Hyperliquid and Hyperbot. While external calls are mocked in tests, some internal methods are complex and integration-heavy. Coverage is ~49% with focus on scoring logic and API integration patterns. Full coverage would require extensive mocking of private methods.
 
 ---
 

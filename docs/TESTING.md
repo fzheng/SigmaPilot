@@ -42,7 +42,7 @@ npm test -- validation   # Run specific test file
 | hyperliquid.integration.test.ts | 35 | External API calls |
 | leaderboard.test.ts | 40 | Leaderboard scoring |
 | leaderboard.integration.test.ts | 56 | Cache, rate limiter, API integration |
-| pagination.test.ts | 14 | Trade deduplication |
+| pagination.test.ts | 12 | Trade deduplication |
 | event-queue.test.ts | 15 | Event streaming |
 | fill-aggregation.test.ts | 20 | Fill grouping |
 | streaming-aggregation.test.ts | 25 | Real-time aggregation |
