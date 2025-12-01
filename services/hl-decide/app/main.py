@@ -18,7 +18,7 @@ Key responsibilities:
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 from uuid import uuid4
 from collections import OrderedDict
@@ -132,6 +132,51 @@ async def persist_outcome(conn, outcome: OutcomeEvent):
     )
 
 
+async def update_trader_performance(address: str, success: bool, pnl_r: float) -> None:
+    """
+    Update trader performance statistics after a signal outcome.
+    Updates Bayesian prior (alpha/beta) for Thompson Sampling.
+
+    Args:
+        address: Trader's Ethereum address
+        success: Whether the signal was profitable (result_r > 0)
+        pnl_r: P&L in R-multiples
+    """
+    try:
+        async with app.state.db.acquire() as conn:
+            # First ensure the trader exists with default Beta(1,1) prior
+            await conn.execute(
+                """
+                INSERT INTO trader_performance (address)
+                VALUES ($1)
+                ON CONFLICT (address) DO NOTHING
+                """,
+                address.lower(),
+            )
+            # Then update their statistics
+            # alpha += 1 if success, beta += 1 if failure
+            await conn.execute(
+                """
+                UPDATE trader_performance SET
+                    total_signals = total_signals + 1,
+                    winning_signals = winning_signals + $2,
+                    total_pnl_r = total_pnl_r + $3,
+                    alpha = alpha + $4,
+                    beta = beta + $5,
+                    last_signal_at = NOW(),
+                    updated_at = NOW()
+                WHERE address = $1
+                """,
+                address.lower(),
+                1 if success else 0,
+                pnl_r,
+                1 if success else 0,  # alpha increment
+                0 if success else 1,  # beta increment
+            )
+    except Exception as e:
+        print(f"[hl-decide] Failed to update trader performance for {address}: {e}")
+
+
 async def calculate_pnl(signal: SignalEvent, entry_price: float, exit_price: float) -> float:
     """
     Calculate P&L as a fraction (R-multiple).
@@ -184,7 +229,7 @@ async def emit_signal(address: str):
     if not score or not fill:
         return
     with decision_latency.time():
-        signal_ts = datetime.utcnow()
+        signal_ts = datetime.now(timezone.utc)
         ticket_id = str(uuid4())
 
         # Store entry price in payload for later P&L calculation
@@ -236,7 +281,7 @@ async def schedule_close(ticket_id: str, signal: SignalEvent):
 
         outcome = OutcomeEvent(
             ticket_id=ticket_id,
-            closed_ts=datetime.utcnow(),
+            closed_ts=datetime.now(timezone.utc),
             result_r=result_r,
             closed_reason="timebox",
             notes=f"Timeboxed exit: entry={entry_price:.2f}, exit={exit_price:.2f}, pnl_r={result_r:.4f}",
@@ -245,6 +290,10 @@ async def schedule_close(ticket_id: str, signal: SignalEvent):
         async with app.state.db.acquire() as conn:
             await persist_outcome(conn, outcome)
         outcome_counter.inc()
+
+        # Update trader performance for bandit algorithm (online learning)
+        success = result_r > 0
+        await update_trader_performance(signal.address, success, result_r)
     finally:
         # Clean up the task from pending_outcomes to prevent memory leaks
         pending_outcomes.pop(ticket_id, None)

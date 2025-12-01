@@ -48,7 +48,8 @@ import {
   startPriceFeed,
   refreshPriceFeed,
   validatePositionChain,
-  clearTradesForAddress
+  clearTradesForAddress,
+  insertPriceSnapshot
 } from '@hl/ts-lib';
 
 const OWNER_TOKEN = getOwnerToken();
@@ -913,6 +914,24 @@ async function main() {
   setInterval(() => {
     void tracker?.ensureFreshSnapshots();
   }, 30000);
+
+  // Price snapshot job - stores prices to marks_1m for regime detection
+  // Runs every minute to build price history
+  const PRICE_SNAPSHOT_INTERVAL = Number(process.env.PRICE_SNAPSHOT_INTERVAL_MS ?? 60000);
+  setInterval(async () => {
+    try {
+      const prices = getCurrentPrices();
+      if (prices.btc.price != null && Number.isFinite(prices.btc.price)) {
+        await insertPriceSnapshot({ asset: 'BTC', price: prices.btc.price });
+      }
+      if (prices.eth.price != null && Number.isFinite(prices.eth.price)) {
+        await insertPriceSnapshot({ asset: 'ETH', price: prices.eth.price });
+      }
+    } catch (err: any) {
+      logger.warn('price_snapshot_failed', { err: err?.message });
+    }
+  }, PRICE_SNAPSHOT_INTERVAL);
+  logger.info('price_snapshot_job_started', { intervalMs: PRICE_SNAPSHOT_INTERVAL });
 
   // Periodic position chain validation (every 5 minutes)
   // Auto-repairs any addresses with data gaps
