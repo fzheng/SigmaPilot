@@ -144,3 +144,11 @@ vite.config.ts.timestamp-*
 # Claude Code files
 CLAUDE.md
 .claude/
+
+# Temporary files
+temp_*.json
+
+# Playwright
+playwright-report/
+test-results/
+playwright/.cache/

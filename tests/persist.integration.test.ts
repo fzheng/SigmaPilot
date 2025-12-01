@@ -38,11 +38,12 @@ import {
   listLiveFills,
   fetchLatestFillForAddress,
   listCustomAccounts,
-  addCustomAccount,
-  removeCustomAccount,
-  getCustomAccountCount,
-  isCustomAccount,
-  updateCustomAccountNickname,
+  listPinnedAccounts,
+  addCustomPinnedAccount,
+  pinLeaderboardAccount,
+  unpinAccount,
+  getPinnedAccountCount,
+  isPinnedAccount,
   getLastRefreshTime,
   getBackfillFills,
   getOldestFillTime,
@@ -581,7 +582,7 @@ describe('persist.ts database integration', () => {
     });
   });
 
-  describe('Custom Accounts', () => {
+  describe('Pinned Accounts', () => {
     describe('listCustomAccounts', () => {
       it('should return list of custom accounts', async () => {
         mockQuery.mockResolvedValueOnce({
@@ -599,25 +600,26 @@ describe('persist.ts database integration', () => {
       });
     });
 
-    describe('addCustomAccount', () => {
-      it('should add new custom account', async () => {
-        // Transaction flow: BEGIN, LOCK TABLE, COUNT, INSERT, COMMIT
+    describe('addCustomPinnedAccount', () => {
+      it('should add new custom pinned account', async () => {
+        // Transaction flow: BEGIN, LOCK TABLE, COUNT, CHECK EXISTING, INSERT, COMMIT
         mockClientQuery
           .mockResolvedValueOnce({}) // BEGIN
           .mockResolvedValueOnce({}) // LOCK TABLE
-          .mockResolvedValueOnce({ rows: [{ cnt: 1 }] }) // COUNT (1 existing)
+          .mockResolvedValueOnce({ rows: [{ cnt: 1 }] }) // COUNT (1 existing custom)
+          .mockResolvedValueOnce({ rows: [] }) // CHECK EXISTING (not already pinned)
           .mockResolvedValueOnce({
-            rows: [{ id: 3, address: '0xnew', nickname: 'NewWhale', added_at: '2025-01-01' }],
+            rows: [{ id: 3, address: '0xnew', is_custom: true, pinned_at: '2025-01-01' }],
           }) // INSERT
           .mockResolvedValueOnce({}); // COMMIT
 
-        const result = await addCustomAccount('0xNEW', 'NewWhale');
+        const result = await addCustomPinnedAccount('0xNEW');
 
         expect(result.success).toBe(true);
-        expect(result.account!.nickname).toBe('NewWhale');
+        expect(result.account!.isCustom).toBe(true);
       });
 
-      it('should reject when limit reached', async () => {
+      it('should reject when custom limit reached', async () => {
         // Transaction flow: BEGIN, LOCK TABLE, COUNT (3 = limit), ROLLBACK
         mockClientQuery
           .mockResolvedValueOnce({}) // BEGIN
@@ -625,83 +627,271 @@ describe('persist.ts database integration', () => {
           .mockResolvedValueOnce({ rows: [{ cnt: 3 }] }) // COUNT = 3 (limit reached)
           .mockResolvedValueOnce({}); // ROLLBACK
 
-        const result = await addCustomAccount('0xnew');
+        const result = await addCustomPinnedAccount('0xnew');
 
         expect(result.success).toBe(false);
         expect(result.error).toContain('Maximum');
       });
 
       it('should handle duplicate address', async () => {
-        // Transaction flow: BEGIN, LOCK TABLE, COUNT, INSERT (returns empty = conflict), ROLLBACK
+        // Transaction flow: BEGIN, LOCK TABLE, COUNT, CHECK EXISTING (found), ROLLBACK
         mockClientQuery
           .mockResolvedValueOnce({}) // BEGIN
           .mockResolvedValueOnce({}) // LOCK TABLE
-          .mockResolvedValueOnce({ rows: [{ cnt: 0 }] }) // COUNT = 0 existing accounts
-          .mockResolvedValueOnce({ rows: [] }) // INSERT returns empty (ON CONFLICT DO NOTHING)
+          .mockResolvedValueOnce({ rows: [{ cnt: 0 }] }) // COUNT = 0 existing custom accounts
+          .mockResolvedValueOnce({ rows: [{ is_custom: false }] }) // CHECK EXISTING (already pinned)
           .mockResolvedValueOnce({}); // ROLLBACK
 
-        const result = await addCustomAccount('0xexisting');
+        const result = await addCustomPinnedAccount('0xexisting');
 
         expect(result.success).toBe(false);
-        expect(result.error).toContain('already exists');
+        expect(result.error).toContain('already pinned');
       });
     });
 
-    describe('removeCustomAccount', () => {
-      it('should remove account and return true', async () => {
+    describe('pinLeaderboardAccount', () => {
+      it('should pin account from leaderboard', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [{ id: 1, address: '0x1234', is_custom: false, pinned_at: '2025-01-01' }],
+        });
+
+        const result = await pinLeaderboardAccount('0x1234');
+
+        expect(result.success).toBe(true);
+        expect(result.account!.isCustom).toBe(false);
+      });
+
+      it('should return error for duplicate', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [] }); // ON CONFLICT DO NOTHING returns empty
+
+        const result = await pinLeaderboardAccount('0xexisting');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('already pinned');
+      });
+    });
+
+    describe('unpinAccount', () => {
+      it('should unpin account and return true', async () => {
         mockQuery.mockResolvedValueOnce({ rowCount: 1 });
-        const result = await removeCustomAccount('0x1234');
+        const result = await unpinAccount('0x1234');
         expect(result).toBe(true);
       });
 
       it('should return false when account not found', async () => {
         mockQuery.mockResolvedValueOnce({ rowCount: 0 });
-        const result = await removeCustomAccount('0xnotfound');
+        const result = await unpinAccount('0xnotfound');
         expect(result).toBe(false);
       });
     });
 
-    describe('getCustomAccountCount', () => {
-      it('should return count of custom accounts', async () => {
+    describe('getPinnedAccountCount', () => {
+      it('should return count of all pinned accounts', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ cnt: 5 }] });
+        const result = await getPinnedAccountCount();
+        expect(result).toBe(5);
+      });
+
+      it('should return count of custom pinned accounts when filtered', async () => {
         mockQuery.mockResolvedValueOnce({ rows: [{ cnt: 2 }] });
-        const result = await getCustomAccountCount();
+        const result = await getPinnedAccountCount(true);
         expect(result).toBe(2);
       });
     });
 
-    describe('isCustomAccount', () => {
-      it('should return true for existing custom account', async () => {
-        mockQuery.mockResolvedValueOnce({ rows: [{ 1: 1 }] });
-        const result = await isCustomAccount('0x1234');
-        expect(result).toBe(true);
+    describe('isPinnedAccount', () => {
+      it('should return pinned status for custom account', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ is_custom: true }] });
+        const result = await isPinnedAccount('0x1234');
+        expect(result).toEqual({ isPinned: true, isCustom: true });
       });
 
-      it('should return false for non-custom account', async () => {
+      it('should return pinned status for leaderboard-pinned account', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ is_custom: false }] });
+        const result = await isPinnedAccount('0x1234');
+        expect(result).toEqual({ isPinned: true, isCustom: false });
+      });
+
+      it('should return null for non-pinned account', async () => {
         mockQuery.mockResolvedValueOnce({ rows: [] });
-        const result = await isCustomAccount('0xnotcustom');
+        const result = await isPinnedAccount('0xnotpinned');
+        expect(result).toBeNull();
+      });
+    });
+
+    describe('listPinnedAccounts', () => {
+      it('should list all pinned accounts', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [
+            { id: 1, address: '0x1111', is_custom: false, pinned_at: '2025-01-01' },
+            { id: 2, address: '0x2222', is_custom: true, pinned_at: '2025-01-02' },
+          ],
+        });
+
+        const result = await listPinnedAccounts();
+
+        expect(result).toHaveLength(2);
+        expect(result[0].isCustom).toBe(false);
+        expect(result[1].isCustom).toBe(true);
+      });
+
+      it('should filter by isCustom when specified', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [{ id: 2, address: '0x2222', is_custom: true, pinned_at: '2025-01-02' }],
+        });
+
+        const result = await listPinnedAccounts(true);
+
+        expect(result).toHaveLength(1);
+        expect(result[0].isCustom).toBe(true);
+      });
+
+      it('should filter by isCustom=false for leaderboard-pinned', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [{ id: 1, address: '0x1111', is_custom: false, pinned_at: '2025-01-01' }],
+        });
+
+        const result = await listPinnedAccounts(false);
+
+        expect(result).toHaveLength(1);
+        expect(result[0].isCustom).toBe(false);
+      });
+
+      it('should return empty array when no pinned accounts', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [] });
+
+        const result = await listPinnedAccounts();
+
+        expect(result).toEqual([]);
+      });
+
+      it('should handle database error', async () => {
+        mockQuery.mockRejectedValueOnce(new Error('DB error'));
+
+        const result = await listPinnedAccounts();
+
+        expect(result).toEqual([]);
+      });
+    });
+
+    describe('pinLeaderboardAccount edge cases', () => {
+      it('should normalize address to lowercase', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [{ id: 1, address: '0xabcd', is_custom: false, pinned_at: '2025-01-01' }],
+        });
+
+        await pinLeaderboardAccount('0xABCD');
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('INSERT INTO hl_pinned_accounts'),
+          ['0xabcd']
+        );
+      });
+
+      it('should handle database error gracefully', async () => {
+        mockQuery.mockRejectedValueOnce(new Error('DB connection failed'));
+
+        const result = await pinLeaderboardAccount('0x1234');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Failed');
+      });
+    });
+
+    describe('addCustomPinnedAccount edge cases', () => {
+      it('should normalize address to lowercase', async () => {
+        mockClientQuery
+          .mockResolvedValueOnce({}) // BEGIN
+          .mockResolvedValueOnce({}) // LOCK
+          .mockResolvedValueOnce({ rows: [{ cnt: 0 }] }) // COUNT
+          .mockResolvedValueOnce({ rows: [] }) // CHECK EXISTING
+          .mockResolvedValueOnce({
+            rows: [{ id: 1, address: '0xabcd', is_custom: true, pinned_at: '2025-01-01' }],
+          }) // INSERT
+          .mockResolvedValueOnce({}); // COMMIT
+
+        const result = await addCustomPinnedAccount('0xABCD');
+
+        expect(result.success).toBe(true);
+        // Verify the address was lowercased in the INSERT
+        expect(mockClientQuery).toHaveBeenCalledWith(
+          expect.stringContaining('INSERT INTO hl_pinned_accounts'),
+          ['0xabcd']
+        );
+      });
+
+      it('should handle transaction rollback on error', async () => {
+        mockClientQuery
+          .mockResolvedValueOnce({}) // BEGIN
+          .mockResolvedValueOnce({}) // LOCK
+          .mockRejectedValueOnce(new Error('DB error')) // COUNT fails
+          .mockResolvedValueOnce({}); // ROLLBACK
+
+        const result = await addCustomPinnedAccount('0x1234');
+
+        expect(result.success).toBe(false);
+        // ROLLBACK should have been called
+        expect(mockClientQuery).toHaveBeenCalledWith('ROLLBACK');
+      });
+    });
+
+    describe('unpinAccount edge cases', () => {
+      it('should normalize address to lowercase', async () => {
+        mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+
+        await unpinAccount('0xABCD');
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('DELETE FROM hl_pinned_accounts'),
+          ['0xabcd']
+        );
+      });
+
+      it('should handle database error', async () => {
+        mockQuery.mockRejectedValueOnce(new Error('DB error'));
+
+        const result = await unpinAccount('0x1234');
+
         expect(result).toBe(false);
       });
     });
 
-    describe('updateCustomAccountNickname', () => {
-      it('should update nickname successfully', async () => {
-        mockQuery.mockResolvedValueOnce({
-          rows: [{ id: 1, address: '0x1234', nickname: 'NewName', added_at: '2025-01-01' }],
-        });
+    describe('getPinnedAccountCount edge cases', () => {
+      it('should return 0 on database error', async () => {
+        mockQuery.mockRejectedValueOnce(new Error('DB error'));
 
-        const result = await updateCustomAccountNickname('0x1234', 'NewName');
+        const result = await getPinnedAccountCount();
 
-        expect(result.success).toBe(true);
-        expect(result.account!.nickname).toBe('NewName');
+        expect(result).toBe(0);
       });
 
-      it('should return error when account not found', async () => {
-        mockQuery.mockResolvedValueOnce({ rows: [] });
+      it('should return 0 when result is null', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ cnt: null }] });
 
-        const result = await updateCustomAccountNickname('0xnotfound', 'Name');
+        const result = await getPinnedAccountCount();
 
-        expect(result.success).toBe(false);
-        expect(result.error).toContain('not found');
+        expect(result).toBe(0);
+      });
+    });
+
+    describe('isPinnedAccount edge cases', () => {
+      it('should normalize address to lowercase', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ is_custom: true }] });
+
+        await isPinnedAccount('0xABCD');
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('lower(address) = $1'),
+          ['0xabcd']
+        );
+      });
+
+      it('should handle database error', async () => {
+        mockQuery.mockRejectedValueOnce(new Error('DB error'));
+
+        const result = await isPinnedAccount('0x1234');
+
+        expect(result).toBeNull();
       });
     });
   });
@@ -1151,5 +1341,134 @@ describe('Position chain validation and repair', () => {
       expect(result.valid).toBe(false);
       expect(result.gaps.length).toBe(2);
     });
+  });
+});
+
+describe('addCustomPinnedAccount transaction lock path', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockClientQuery.mockReset();
+  });
+
+  it('should execute SQL sequence: BEGIN → LOCK → COUNT → INSERT → COMMIT on success', async () => {
+    // Setup successful transaction flow
+    mockClientQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({}) // LOCK TABLE
+      .mockResolvedValueOnce({ rows: [{ cnt: 0 }] }) // COUNT custom accounts
+      .mockResolvedValueOnce({ rows: [] }) // CHECK EXISTING
+      .mockResolvedValueOnce({
+        rows: [{ id: 1, address: '0xnewaddr', is_custom: true, pinned_at: '2025-01-01' }],
+      }) // INSERT
+      .mockResolvedValueOnce({}); // COMMIT
+
+    const result = await addCustomPinnedAccount('0xNEWADDR');
+
+    expect(result.success).toBe(true);
+
+    // Verify SQL sequence
+    expect(mockClientQuery).toHaveBeenNthCalledWith(1, 'BEGIN');
+    expect(mockClientQuery).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('LOCK TABLE hl_pinned_accounts')
+    );
+    expect(mockClientQuery).toHaveBeenNthCalledWith(
+      3,
+      expect.stringContaining('SELECT COUNT')
+    );
+    expect(mockClientQuery).toHaveBeenNthCalledWith(
+      4,
+      expect.stringContaining('SELECT 1 FROM hl_pinned_accounts'),
+      ['0xnewaddr']
+    );
+    expect(mockClientQuery).toHaveBeenNthCalledWith(
+      5,
+      expect.stringContaining('INSERT INTO hl_pinned_accounts'),
+      ['0xnewaddr']
+    );
+    expect(mockClientQuery).toHaveBeenNthCalledWith(6, 'COMMIT');
+  });
+
+  it('should execute SQL sequence: BEGIN → LOCK → COUNT → ROLLBACK on limit exceeded', async () => {
+    mockClientQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({}) // LOCK TABLE
+      .mockResolvedValueOnce({ rows: [{ cnt: 3 }] }) // COUNT = 3 (limit reached)
+      .mockResolvedValueOnce({}); // ROLLBACK
+
+    const result = await addCustomPinnedAccount('0xnewaddr');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Maximum');
+
+    // Verify SQL sequence - should rollback without insert
+    expect(mockClientQuery).toHaveBeenNthCalledWith(1, 'BEGIN');
+    expect(mockClientQuery).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('LOCK TABLE hl_pinned_accounts')
+    );
+    expect(mockClientQuery).toHaveBeenNthCalledWith(
+      3,
+      expect.stringContaining('SELECT COUNT')
+    );
+    expect(mockClientQuery).toHaveBeenNthCalledWith(4, 'ROLLBACK');
+  });
+
+  it('should execute SQL sequence: BEGIN → LOCK → COUNT → CHECK → ROLLBACK on duplicate', async () => {
+    mockClientQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({}) // LOCK TABLE
+      .mockResolvedValueOnce({ rows: [{ cnt: 1 }] }) // COUNT = 1 (under limit)
+      .mockResolvedValueOnce({ rows: [{ is_custom: true }] }) // EXISTING found
+      .mockResolvedValueOnce({}); // ROLLBACK
+
+    const result = await addCustomPinnedAccount('0xexistingaddr');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('already pinned');
+
+    // Verify rollback after finding existing
+    expect(mockClientQuery).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it('should rollback on COUNT query failure', async () => {
+    mockClientQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({}) // LOCK TABLE
+      .mockRejectedValueOnce(new Error('DB connection lost')) // COUNT fails
+      .mockResolvedValueOnce({}); // ROLLBACK
+
+    const result = await addCustomPinnedAccount('0xnewaddr');
+
+    expect(result.success).toBe(false);
+    expect(mockClientQuery).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it('should rollback on INSERT failure', async () => {
+    mockClientQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({}) // LOCK TABLE
+      .mockResolvedValueOnce({ rows: [{ cnt: 0 }] }) // COUNT
+      .mockResolvedValueOnce({ rows: [] }) // CHECK EXISTING
+      .mockRejectedValueOnce(new Error('Constraint violation')) // INSERT fails
+      .mockResolvedValueOnce({}); // ROLLBACK
+
+    const result = await addCustomPinnedAccount('0xnewaddr');
+
+    expect(result.success).toBe(false);
+    expect(mockClientQuery).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it('should always release client after transaction', async () => {
+    // Even on failure, client should be released
+    // Mock the ROLLBACK to also return a promise for .catch() chain
+    mockClientQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockRejectedValueOnce(new Error('Lock timeout')) // LOCK fails
+      .mockResolvedValueOnce({}); // ROLLBACK
+
+    await addCustomPinnedAccount('0xnewaddr');
+
+    expect(mockClient.release).toHaveBeenCalled();
   });
 });

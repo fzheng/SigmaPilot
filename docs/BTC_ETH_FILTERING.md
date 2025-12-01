@@ -76,14 +76,20 @@ The filter fetches completed trades data for each address (up to 2000 most recen
 
 4. **Publishing**: Only qualified accounts are published as `CandidateEvent` to NATS
 
-## Custom Accounts
+## Pinned Accounts
 
-**Custom accounts bypass this filter**. Accounts added via the custom accounts API:
+**Pinned accounts bypass this filter**. Accounts pinned via the dashboard or API:
 ```bash
-POST /custom-accounts
+# Pin account from leaderboard (unlimited)
+POST /pinned-accounts/leaderboard
 {
-  "address": "0x...",
-  "nickname": "Optional Name"
+  "address": "0x..."
+}
+
+# Add custom pinned account (max 3)
+POST /pinned-accounts/custom
+{
+  "address": "0x..."
 }
 ```
 
@@ -196,7 +202,7 @@ If the API call to fetch completed trades fails:
 - Each API call fetches up to 2000 trades
 - Typical latency: 200-500ms per account
 - For 10 qualified accounts from 50 candidates: ~10-25 seconds total
-- Filtering only runs during leaderboard refresh (controlled by `LEADERBOARD_REFRESH_MS`)
+- Filtering only runs during leaderboard refresh (daily at 00:30 UTC)
 
 ## Example Scenarios
 
