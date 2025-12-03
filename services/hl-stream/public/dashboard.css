@@ -2314,6 +2314,24 @@ td {
   display: flex;
   gap: 16px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+.alpha-pool-config .refresh-timing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.alpha-pool-config .refresh-timing.next {
+  color: var(--text-muted);
+}
+
+.alpha-pool-config .refresh-overdue {
+  color: var(--color-negative);
+  font-weight: 500;
 }
 
 .alpha-pool-table-container {

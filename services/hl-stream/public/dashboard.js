@@ -2212,11 +2212,47 @@ async function refreshAlphaPool() {
       alphaPoolStats.textContent = `${data.count} traders | ${selectedCount} selected`;
     }
 
-    // Update config display
+    // Update config display with refresh timing
     if (alphaPoolConfig) {
+      let refreshInfo = '';
+      if (data.last_refreshed) {
+        const lastRefreshed = new Date(data.last_refreshed);
+        const nextRefresh = data.next_refresh ? new Date(data.next_refresh) : null;
+        const now = new Date();
+
+        // Format relative time for last refresh (uses existing fmtRelativeTime)
+        const lastAgo = fmtRelativeTime(data.last_refreshed);
+
+        // Format next refresh
+        let nextInfo = '';
+        if (nextRefresh) {
+          if (nextRefresh <= now) {
+            nextInfo = '<span class="refresh-overdue">overdue</span>';
+          } else {
+            // Calculate time until next refresh
+            const diffMs = nextRefresh.getTime() - now.getTime();
+            const hours = Math.floor(diffMs / (1000 * 60 * 60));
+            const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+            if (hours > 0) {
+              nextInfo = `in ${hours}h ${minutes}m`;
+            } else {
+              nextInfo = `in ${minutes}m`;
+            }
+          }
+        }
+
+        refreshInfo = `
+          <span class="refresh-timing" title="Last refreshed: ${lastRefreshed.toLocaleString()}">
+            🕐 ${lastAgo}
+          </span>
+          ${nextRefresh ? `<span class="refresh-timing next" title="Next refresh: ${nextRefresh.toLocaleString()}">→ Next ${nextInfo}</span>` : ''}
+        `;
+      }
+
       alphaPoolConfig.innerHTML = `
-        <span>Pool Size: ${data.pool_size}</span>
-        <span>Select K: ${data.select_k}</span>
+        <span>Pool: ${data.pool_size}</span>
+        <span>K: ${data.select_k}</span>
+        ${refreshInfo}
       `;
     }
 

@@ -701,6 +701,21 @@ async def get_alpha_pool(
         pnl_curves = await get_pnl_curves_for_addresses(addresses)
         nicknames = await get_nicknames_for_addresses(app.state.db, addresses)
 
+        # Get pool refresh timing info
+        last_refreshed = None
+        next_refresh = None
+        async with app.state.db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT MAX(last_refreshed) as last_refreshed
+                FROM alpha_pool_addresses
+                WHERE is_active = true
+                """
+            )
+            if row and row["last_refreshed"]:
+                last_refreshed = row["last_refreshed"].isoformat()
+                next_refresh = (row["last_refreshed"] + timedelta(hours=ALPHA_POOL_REFRESH_HOURS)).isoformat()
+
         traders = []
         for p in posteriors:
             # Calculate posterior variance for uncertainty display
@@ -727,6 +742,9 @@ async def get_alpha_pool(
             "count": len(traders),
             "pool_size": BANDIT_POOL_SIZE,
             "select_k": BANDIT_SELECT_K,
+            "refresh_interval_hours": ALPHA_POOL_REFRESH_HOURS,
+            "last_refreshed": last_refreshed,
+            "next_refresh": next_refresh,
             "traders": traders,
         }
     except Exception as e:
@@ -873,6 +891,7 @@ ALPHA_POOL_MIN_ROI = float(os.getenv("ALPHA_POOL_MIN_ROI", "0.10"))  # Min 10% 3
 ALPHA_POOL_MAX_VLM_RATIO = float(os.getenv("ALPHA_POOL_MAX_VLM_RATIO", "200"))  # Max 200x volume/AV (filter HFT)
 ALPHA_POOL_MIN_ACCOUNT_VALUE = float(os.getenv("ALPHA_POOL_MIN_ACCOUNT_VALUE", "100000"))  # Min $100k AV
 ALPHA_POOL_MIN_WEEK_VLM = float(os.getenv("ALPHA_POOL_MIN_WEEK_VLM", "10000"))  # Min $10k weekly volume (filter inactive)
+ALPHA_POOL_REFRESH_HOURS = int(os.getenv("ALPHA_POOL_REFRESH_HOURS", "24"))  # Refresh interval in hours (default 24h)
 
 
 async def fetch_leaderboard_from_api(
