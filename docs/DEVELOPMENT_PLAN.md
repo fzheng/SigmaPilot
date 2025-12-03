@@ -173,18 +173,20 @@ The Alpha Pool is now a completely independent system from the legacy leaderboar
 | **Nicknames** | `alpha_pool_addresses.nickname` | `hl_leaderboard_entries.remark` |
 | **Refresh** | `POST /alpha-pool/refresh` | hl-scout daily cron |
 | **Data Source** | `stats-data.hyperliquid.xyz` | hyperbot.network API |
-| **Quality Filters** | 5 quality gates (see below) | None |
+| **Quality Filters** | 7 quality gates (see below) | None |
 
 **Alpha Pool Quality Filters**:
-The refresh process applies 5 quality gates to filter out noise:
+The refresh process applies 7 quality gates to filter out noise:
 
 | Filter | Threshold | Purpose |
 |--------|-----------|---------|
-| `ALPHA_POOL_MIN_PNL` | $1,000 | Positive 30d PnL (remove losers) |
-| `ALPHA_POOL_MIN_ROI` | 1% | Positive 30d ROI (consistent returns) |
-| `ALPHA_POOL_MAX_VLM_RATIO` | 500x | Volume/AV ratio (remove HFT) |
-| `ALPHA_POOL_MIN_ACCOUNT_VALUE` | $10,000 | Minimum account size |
-| `ALPHA_POOL_MIN_WEEK_VLM` | $1,000 | Weekly volume (remove inactive) |
+| `ALPHA_POOL_MIN_PNL` | $10,000 | Positive 30d PnL (remove losers) |
+| `ALPHA_POOL_MIN_ROI` | 10% | Positive 30d ROI (consistent returns) |
+| `ALPHA_POOL_MIN_ACCOUNT_VALUE` | $100,000 | Minimum account size |
+| `ALPHA_POOL_MIN_WEEK_VLM` | $10,000 | Weekly volume (remove inactive) |
+| `ALPHA_POOL_MAX_ORDERS_PER_DAY` | 100 | Orders/day (remove HFT via fill history analysis) |
+| Subaccount check | N/A | Remove users with subaccounts (untrackable) |
+| BTC/ETH history | N/A | Must have traded BTC or ETH (we only track these) |
 
 **Key APIs**:
 - `POST /alpha-pool/refresh` - Populate Alpha Pool with quality filtering

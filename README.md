@@ -9,7 +9,7 @@
 ## What It Does
 
 - **Scans Top Traders**: Continuously monitors 1000+ traders on Hyperliquid leaderboard
-- **Quality Filtering**: Removes losers, HFT bots, and inactive accounts with 5 quality gates
+- **Quality Filtering**: Removes losers, HFT bots, and inactive accounts with 7 quality gates
 - **Alpha Pool**: NIG-based Thompson Sampling selects top 50 qualified traders with Bayesian confidence
 - **Real-time Tracking**: Monitors positions and trades of top performers live
 - **Pin Favorites**: Pin accounts from leaderboard or add custom addresses to track
@@ -19,15 +19,17 @@
 
 ### Alpha Pool Quality Filters
 
-The Alpha Pool automatically filters out noise traders:
+The Alpha Pool automatically filters out noise traders with 7 quality gates:
 
 | Filter | Default | Description |
 |--------|---------|-------------|
 | Min 30d PnL | $1,000 | Only profitable traders |
 | Min 30d ROI | 1% | Consistent positive returns |
-| Max Vlm/AV | 500x | Filters out HFT bots |
-| Min Account | $10,000 | Minimum account size |
+| Min Account | $10,000 | Minimum account value |
 | Min Week Vlm | $1,000 | Must be actively trading |
+| Max Orders/Day | 100 | Filters out HFT bots via fill history |
+| Subaccounts | Excluded | Filters subaccounts (address:X format) |
+| BTC/ETH History | Required | Must have traded BTC or ETH |
 
 ## Quick Start
 

@@ -2101,8 +2101,12 @@ async function init() {
   // Check positions status FIRST before loading data
   await checkPositionsStatus();
   refreshSummary();
+  // Load Alpha Pool data first so alphaPoolAddresses is populated before fills
+  await refreshAlphaPool();
   // Await initial fills load to prevent double-render flash
   await refreshFills();
+  // Render Alpha Pool activity after both datasets are loaded
+  renderAlphaFills();
   renderAIRecommendations();
   refreshBanditStatus();
   connectWs();
@@ -2316,9 +2320,17 @@ function renderAlphaFills() {
     const action = fill.action || (fill.side === 'buy' ? 'Buy' : 'Sell');
     const actionClass = action.toLowerCase().includes('long') || action.toLowerCase().includes('buy') ? 'positive' : 'negative';
     const symbol = fill.symbol || fill.asset || 'BTC';
-    const time = fill.at ? new Date(fill.at).toLocaleTimeString() : '—';
-    const pnl = fill.realizedPnlUsd != null ? (fill.realizedPnlUsd >= 0 ? '+' : '') + fill.realizedPnlUsd.toFixed(2) : '—';
-    const pnlClass = fill.realizedPnlUsd > 0 ? 'positive' : fill.realizedPnlUsd < 0 ? 'negative' : '';
+    // Handle both field naming conventions (time_utc from API, at from WS)
+    const timeStr = fill.time_utc || fill.at;
+    const time = timeStr ? new Date(timeStr).toLocaleTimeString() : '—';
+    // Handle both field naming conventions (size_signed from API, size from WS)
+    const size = Math.abs(fill.size_signed ?? fill.size ?? 0);
+    // Handle both field naming conventions (price_usd from API, priceUsd/price from WS)
+    const price = fill.price_usd ?? fill.priceUsd ?? fill.price ?? 0;
+    // Handle both field naming conventions (closed_pnl_usd from API, realizedPnlUsd from WS)
+    const pnlValue = fill.closed_pnl_usd ?? fill.realizedPnlUsd;
+    const pnl = pnlValue != null ? (pnlValue >= 0 ? '+' : '') + pnlValue.toFixed(2) : '—';
+    const pnlClass = pnlValue > 0 ? 'positive' : pnlValue < 0 ? 'negative' : '';
 
     return `
       <tr>
@@ -2329,8 +2341,8 @@ function renderAlphaFills() {
           </a>
         </td>
         <td class="${actionClass}">${action}</td>
-        <td>${Number(fill.size || 0).toFixed(4)} ${symbol}</td>
-        <td>$${Number(fill.priceUsd || fill.price || 0).toLocaleString()}</td>
+        <td>${size.toFixed(4)} ${symbol}</td>
+        <td>$${Number(price).toLocaleString()}</td>
         <td class="${pnlClass}">${pnl}</td>
       </tr>
     `;

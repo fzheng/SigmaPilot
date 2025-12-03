@@ -523,7 +523,7 @@ PNL_CURVE_CONCURRENCY = 2  # Max concurrent requests (reduced to avoid rate limi
 PNL_CURVE_TIMEOUT = 10.0  # Timeout per request in seconds
 PNL_CURVE_DELAY = 0.3  # Delay between requests in seconds
 PNL_CURVE_MAX_RETRIES = 2  # Max retries on rate limit
-PNL_CURVE_CACHE_TTL = int(os.getenv("PNL_CURVE_CACHE_TTL", "21600"))  # Cache TTL in seconds (default 6 hours)
+PNL_CURVE_CACHE_TTL = int(os.getenv("PNL_CURVE_CACHE_TTL", "86400"))  # Cache TTL in seconds (default 24 hours)
 
 # In-memory cache for PnL curves: {address: (timestamp, curve_data)}
 _pnl_curve_cache: Dict[str, tuple] = {}
@@ -875,19 +875,24 @@ async def check_has_subaccounts(client: httpx.AsyncClient, address: str) -> bool
         return False
 
 
-async def check_has_btc_eth_fills(client: httpx.AsyncClient, address: str) -> bool:
+# Quality filter thresholds for Alpha Pool
+ALPHA_POOL_MIN_PNL = float(os.getenv("ALPHA_POOL_MIN_PNL", "10000"))  # Min $10k 30d PnL
+ALPHA_POOL_MIN_ROI = float(os.getenv("ALPHA_POOL_MIN_ROI", "0.10"))  # Min 10% 30d ROI
+ALPHA_POOL_MIN_ACCOUNT_VALUE = float(os.getenv("ALPHA_POOL_MIN_ACCOUNT_VALUE", "100000"))  # Min $100k AV
+ALPHA_POOL_MIN_WEEK_VLM = float(os.getenv("ALPHA_POOL_MIN_WEEK_VLM", "10000"))  # Min $10k weekly volume (filter inactive)
+ALPHA_POOL_MAX_ORDERS_PER_DAY = float(os.getenv("ALPHA_POOL_MAX_ORDERS_PER_DAY", "100"))  # Max 100 orders/day (filter HFT)
+ALPHA_POOL_REFRESH_HOURS = int(os.getenv("ALPHA_POOL_REFRESH_HOURS", "24"))  # Refresh interval in hours (default 24h)
+
+
+async def analyze_user_fills(client: httpx.AsyncClient, address: str) -> Dict[str, Any]:
     """
-    Check if an address has BTC or ETH trading history.
+    Analyze user's fill history for HFT detection and BTC/ETH trading.
 
-    We only track BTC and ETH positions, so traders who only trade other
-    assets (HYPE, SOL, etc.) are not useful for our consensus signals.
+    This combines multiple checks into one API call to avoid rate limits:
+    - orders_per_day: HFT detection (> 100 orders/day = HFT)
+    - has_btc_eth: Whether trader has BTC or ETH fills
 
-    Args:
-        client: Async HTTP client
-        address: Ethereum address to check
-
-    Returns:
-        True if address has traded BTC or ETH, False otherwise
+    Returns dict with analysis results, or None on error.
     """
     try:
         response = await client.post(
@@ -895,27 +900,51 @@ async def check_has_btc_eth_fills(client: httpx.AsyncClient, address: str) -> bo
             json={"type": "userFills", "user": address.lower()},
             timeout=10.0,
         )
-        if response.status_code == 200:
-            fills = response.json()
-            if not isinstance(fills, list):
-                return False
-            # Check if any fill is for BTC or ETH
-            for fill in fills[:100]:  # Check first 100 fills for efficiency
-                coin = fill.get("coin", "").upper()
-                if coin in ("BTC", "ETH"):
-                    return True
-            return False
-        return False
-    except Exception:
-        return False
+        if response.status_code != 200:
+            return None
 
-# Quality filter thresholds for Alpha Pool
-ALPHA_POOL_MIN_PNL = float(os.getenv("ALPHA_POOL_MIN_PNL", "10000"))  # Min $10k 30d PnL
-ALPHA_POOL_MIN_ROI = float(os.getenv("ALPHA_POOL_MIN_ROI", "0.10"))  # Min 10% 30d ROI
-ALPHA_POOL_MAX_VLM_RATIO = float(os.getenv("ALPHA_POOL_MAX_VLM_RATIO", "200"))  # Max 200x volume/AV (filter HFT)
-ALPHA_POOL_MIN_ACCOUNT_VALUE = float(os.getenv("ALPHA_POOL_MIN_ACCOUNT_VALUE", "100000"))  # Min $100k AV
-ALPHA_POOL_MIN_WEEK_VLM = float(os.getenv("ALPHA_POOL_MIN_WEEK_VLM", "10000"))  # Min $10k weekly volume (filter inactive)
-ALPHA_POOL_REFRESH_HOURS = int(os.getenv("ALPHA_POOL_REFRESH_HOURS", "24"))  # Refresh interval in hours (default 24h)
+        fills = response.json()
+        if not isinstance(fills, list):
+            return None
+
+        result = {
+            "orders_per_day": 0.0,
+            "has_btc_eth": False,
+            "fill_count": len(fills),
+        }
+
+        if len(fills) == 0:
+            return result
+
+        # Check for BTC/ETH fills
+        for fill in fills:
+            coin = fill.get("coin", "").upper()
+            if coin in ("BTC", "ETH"):
+                result["has_btc_eth"] = True
+                break
+
+        # Calculate orders per day for HFT detection
+        orders_by_id: Dict[str, List[dict]] = {}
+        for fill in fills:
+            oid = str(fill.get("oid", ""))
+            if oid not in orders_by_id:
+                orders_by_id[oid] = []
+            orders_by_id[oid].append(fill)
+
+        unique_orders = len(orders_by_id)
+        if unique_orders > 0:
+            all_times = [f.get("time", 0) for f in fills if f.get("time")]
+            if len(all_times) >= 2:
+                first_time = min(all_times)
+                last_time = max(all_times)
+                span_days = (last_time - first_time) / (1000 * 60 * 60 * 24)
+                if span_days >= 0.01:  # At least ~15 minutes of data
+                    result["orders_per_day"] = unique_orders / span_days
+
+        return result
+    except Exception as e:
+        print(f"[hl-sage] Error analyzing fills for {address}: {e}")
+        return None
 
 
 async def fetch_leaderboard_from_api(
@@ -927,9 +956,9 @@ async def fetch_leaderboard_from_api(
     Quality filters applied:
     1. Positive 30d PnL (> ALPHA_POOL_MIN_PNL, default $10k)
     2. Positive 30d ROI (> ALPHA_POOL_MIN_ROI, default 10%)
-    3. Remove HFT (volume/AV ratio < ALPHA_POOL_MAX_VLM_RATIO, default 200x)
-    4. Minimum account value (> ALPHA_POOL_MIN_ACCOUNT_VALUE, default $100k)
-    5. Recent activity (week volume > ALPHA_POOL_MIN_WEEK_VLM, default $10k)
+    3. Minimum account value (> ALPHA_POOL_MIN_ACCOUNT_VALUE, default $100k)
+    4. Recent activity (week volume > ALPHA_POOL_MIN_WEEK_VLM, default $10k)
+    5. Remove HFT (orders/day > ALPHA_POOL_MAX_ORDERS_PER_DAY, default 100)
     6. No subaccounts (master addresses with subaccounts can't be tracked)
     7. BTC/ETH trading history (must have traded BTC or ETH)
 
@@ -978,9 +1007,7 @@ async def fetch_leaderboard_from_api(
                 window_perfs = entry.get("windowPerformances", [])
                 month_pnl = 0.0
                 month_roi = 0.0
-                month_vlm = 0.0
                 week_vlm = 0.0
-                alltime_vlm = 0.0
 
                 for wp in window_perfs:
                     if not isinstance(wp, list) or len(wp) < 2:
@@ -991,13 +1018,10 @@ async def fetch_leaderboard_from_api(
                     if wp_name == "month":
                         month_pnl = float(perf_data.get("pnl", 0))
                         month_roi = float(perf_data.get("roi", 0))
-                        month_vlm = float(perf_data.get("vlm", 0))
                     elif wp_name == "week":
                         week_vlm = float(perf_data.get("vlm", 0))
-                    elif wp_name == "allTime":
-                        alltime_vlm = float(perf_data.get("vlm", 0))
 
-                # Apply quality filters
+                # Apply quality filters (fast, no API calls)
                 # 1. Positive PnL filter
                 if month_pnl < ALPHA_POOL_MIN_PNL:
                     filtered_counts["negative_pnl"] += 1
@@ -1008,31 +1032,22 @@ async def fetch_leaderboard_from_api(
                     filtered_counts["low_roi"] += 1
                     continue
 
-                # 3. HFT filter (high volume/AV ratio)
-                # Use all-time ratio as primary indicator (more reliable for detecting HFT)
-                # Fall back to month ratio if alltime not available
-                vlm_ratio = alltime_vlm / max(account_value, 1) if alltime_vlm > 0 else month_vlm / max(account_value, 1)
-                if vlm_ratio > ALPHA_POOL_MAX_VLM_RATIO:
-                    filtered_counts["hft"] += 1
-                    continue
-
-                # 4. Minimum account value filter
+                # 3. Minimum account value filter
                 if account_value < ALPHA_POOL_MIN_ACCOUNT_VALUE:
                     filtered_counts["low_account_value"] += 1
                     continue
 
-                # 5. Activity filter (must have traded in the last week)
+                # 4. Activity filter (must have traded in the last week)
                 if week_vlm < ALPHA_POOL_MIN_WEEK_VLM:
                     filtered_counts["inactive"] += 1
                     continue
 
-                # Passed initial filters - add to candidates for subaccount check
+                # Passed initial filters - add to candidates for API-based checks
                 qualified_traders.append({
                     "address": address,
                     "account_value": account_value,
                     "pnl": month_pnl,
                     "roi": month_roi,
-                    "vlm_ratio": vlm_ratio,
                     "week_vlm": week_vlm,
                     "win_rate": 0.0,  # Not available in this API
                     "display_name": display_name,
@@ -1049,12 +1064,26 @@ async def fetch_leaderboard_from_api(
             # Sort by PnL descending before API-based checks
             qualified_traders.sort(key=lambda t: t["pnl"], reverse=True)
 
-            # 6 & 7. API-based filters: subaccounts and BTC/ETH trading history
+            # 5, 6, 7. API-based filters: HFT, subaccounts, and BTC/ETH trading history
             # These require individual API calls so we do them last
             final_traders = []
             for trader in qualified_traders:
                 if len(final_traders) >= limit:
                     break
+
+                # 5 & 7. Combined fill analysis (HFT + BTC/ETH check in one API call)
+                fill_analysis = await analyze_user_fills(client, trader["address"])
+                if fill_analysis is None:
+                    # API error - skip this trader
+                    print(f"[hl-sage] Failed to analyze fills for: {trader['address']}")
+                    continue
+
+                # 5. HFT filter: check orders per day
+                orders_per_day = fill_analysis["orders_per_day"]
+                if orders_per_day > ALPHA_POOL_MAX_ORDERS_PER_DAY:
+                    filtered_counts["hft"] += 1
+                    print(f"[hl-sage] Filtered HFT ({orders_per_day:.1f} orders/day): {trader['address']}")
+                    continue
 
                 # 6. Subaccount filter: check if addresses use subaccounts
                 # (trading happens on subaccounts which we can't track directly)
@@ -1065,16 +1094,16 @@ async def fetch_leaderboard_from_api(
                     continue
 
                 # 7. BTC/ETH filter: must have traded BTC or ETH
-                # (we only track these assets for consensus signals)
-                has_btc_eth = await check_has_btc_eth_fills(client, trader["address"])
-                if not has_btc_eth:
+                if not fill_analysis["has_btc_eth"]:
                     filtered_counts["no_btc_eth"] += 1
                     print(f"[hl-sage] Filtered no BTC/ETH history: {trader['address']}")
                     continue
 
+                # Store orders_per_day for debugging/display
+                trader["orders_per_day"] = orders_per_day
                 final_traders.append(trader)
 
-            print(f"[hl-sage] Alpha Pool final: {len(final_traders)} qualified, API filtered: subaccount={filtered_counts['subaccount']}, no_btc_eth={filtered_counts['no_btc_eth']}")
+            print(f"[hl-sage] Alpha Pool final: {len(final_traders)} qualified, API filtered: hft={filtered_counts['hft']}, subaccount={filtered_counts['subaccount']}, no_btc_eth={filtered_counts['no_btc_eth']}")
             return final_traders
     except Exception as e:
         print(f"[hl-sage] Failed to fetch leaderboard: {e}")
@@ -1094,9 +1123,9 @@ async def refresh_alpha_pool(
     Quality filters applied (7 gates):
     1. ALPHA_POOL_MIN_PNL: Minimum 30d PnL (default $10k)
     2. ALPHA_POOL_MIN_ROI: Minimum 30d ROI (default 10%)
-    3. ALPHA_POOL_MAX_VLM_RATIO: Maximum volume/AV ratio to filter HFT (default 200x)
-    4. ALPHA_POOL_MIN_ACCOUNT_VALUE: Minimum account value (default $100k)
-    5. ALPHA_POOL_MIN_WEEK_VLM: Minimum weekly volume to filter inactive (default $10k)
+    3. ALPHA_POOL_MIN_ACCOUNT_VALUE: Minimum account value (default $100k)
+    4. ALPHA_POOL_MIN_WEEK_VLM: Minimum weekly volume to filter inactive (default $10k)
+    5. ALPHA_POOL_MAX_ORDERS_PER_DAY: Maximum orders/day to filter HFT (default 100)
     6. No subaccounts: Filters addresses that use subaccounts (untrackable)
     7. BTC/ETH history: Must have traded BTC or ETH (we only track these)
 
@@ -1164,9 +1193,9 @@ async def refresh_alpha_pool(
             "filters": {
                 "min_pnl": ALPHA_POOL_MIN_PNL,
                 "min_roi": ALPHA_POOL_MIN_ROI,
-                "max_vlm_ratio": ALPHA_POOL_MAX_VLM_RATIO,
                 "min_account_value": ALPHA_POOL_MIN_ACCOUNT_VALUE,
                 "min_week_vlm": ALPHA_POOL_MIN_WEEK_VLM,
+                "max_orders_per_day": ALPHA_POOL_MAX_ORDERS_PER_DAY,
             },
         }
     except HTTPException:
