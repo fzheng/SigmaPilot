@@ -1,8 +1,8 @@
-# SigmaPilot
+# Sigma Pilot
 
 ![Coverage](badges/coverage.svg) [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-brightgreen.svg?style=flat-square)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
-**SigmaPilot** is a collective intelligence trading system that learns from the best traders on Hyperliquid. Instead of relying on traditional technical analysis or blindly copy-trading single wallets, SigmaPilot aggregates wisdom from top-performing traders and generates consensus-based trading signals.
+**Sigma Pilot** is a collective intelligence trading system that learns from the best traders on Hyperliquid. Instead of relying on traditional technical analysis or blindly copy-trading single wallets, SigmaPilot aggregates wisdom from top-performing traders and generates consensus-based trading signals.
 
 > "Be as smart as the smartest traders by learning from their collective behavior"
 
