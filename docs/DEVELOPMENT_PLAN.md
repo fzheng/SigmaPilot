@@ -153,9 +153,9 @@ Per external quant review, applied the following corrections:
 Wired the algorithm components into the runtime and created the Alpha Pool UI:
 - [x] **Alpha Pool Tab**: New primary dashboard tab showing NIG-selected traders
 - [x] **Legacy Leaderboard Tab**: Original PnL-curve view preserved as secondary tab
-- [x] **Alpha Pool API** (`/alpha-pool`): Returns 50 Thompson-sampled traders with NIG params
-- [x] **NIG Score Emission**: `hl-sage` now emits scores with NIG posterior mean (when available)
-- [x] **Consensus Runtime**: `hl-decide` processes fills through `ConsensusDetector`
+- [x] **Alpha Pool API** (`/alpha-pool`): Returns 50 traders ranked by NIG posterior mean
+- [x] **NIG Score Emission**: `hl-sage` emits scores with NIG posterior mean (not Thompson Sampling yet)
+- [x] **Consensus Runtime**: `hl-decide` processes fills through `ConsensusDetector` (with placeholder risk)
 - [x] **Consensus Signals Table**: `consensus_signals` DB table with outcome tracking
 - [x] **Consensus API** (`/consensus/signals`, `/consensus/stats`): Query signals and win rates
 - [x] **Self Code Review**: Verified all NIG functions, consensus integration, and file staging
@@ -165,6 +165,8 @@ Wired the algorithm components into the runtime and created the Alpha Pool UI:
 - [x] **HFT Detection Improvement**: Replaced VLM/AV ratio with orders-per-day via fill history analysis
 - [x] **PnL Curve Caching**: 24-hour cache for Alpha Pool PnL curves to reduce API calls
 - [x] **Alpha Pool Activity**: Live fills filtered to pool traders only
+
+**⚠️ Note**: Phase 3a provides the infrastructure but with placeholder implementations. See "Known Implementation Gaps" below for details on what needs to be completed in Phase 3b.
 
 **Alpha Pool Architecture (Decoupled)**:
 The Alpha Pool is now a completely independent system from the legacy leaderboard:
@@ -392,20 +394,56 @@ createTicketInstrumentation(result, windowMs, stopBps)
 - [x] `/consensus/signals` - Recent signals with metrics and outcomes
 - [x] `/consensus/stats` - Aggregate win rate, EV statistics
 
+### Known Implementation Gaps (Code Review - December 2025)
+
+The following gaps exist between the documented design and current implementation:
+
+#### Gap 1: Selection Uses Posterior Mean, Not Thompson Sampling
+**Current**: `hl-sage/main.py` (lines 248-253) ranks traders by `nig_m * side` (posterior mean).
+**Designed**: Thompson Sampling should sample from posterior and rank by sampled values.
+**Impact**: No exploration of uncertain traders; system exploits only proven performers.
+**Fix**: Invoke `thompson_sample_select_nig()` from `bandit.py` instead of sorting by posterior mean.
+
+#### Gap 2: Consensus Gates Use Placeholder Risk Inputs
+**Current**: `consensus.py` (lines 244-250) uses hardcoded 1% stop distance.
+**Designed**: Stop distance should be ATR-based, adjusting to market volatility.
+**Impact**: EV gate and price drift calculations are constant regardless of market regime.
+**Fix**: Add ATR feed (from price history or external API) and use for dynamic stop sizing.
+
+#### Gap 3: Correlation Matrix Not Populated
+**Current**: `ConsensusDetector.correlation_matrix` is initialized empty and never populated.
+**Designed**: Daily job should compute pairwise correlations and store in `trader_corr` table.
+**Impact**: `eff_k` defaults to shrinkage toward `ρ_base=0.3` for all pairs; correlation gate is ineffective.
+**Fix**: Implement daily correlation job (Phase 3b task 3.5).
+
+#### Gap 4: E2E Tests Don't Start App Automatically
+**Current**: `playwright.config.ts` has `webServer` commented out; tests require manual dashboard start.
+**Designed**: Tests should be self-contained with automatic app startup.
+**Impact**: CI/CD may fail if dashboard not pre-started; local dev requires manual steps.
+**Fix**: Uncomment webServer config or document the dependency clearly.
+
 ### Remaining Integration Tasks (Phase 3b)
 
 #### 3.4 Thompson Sampling for Candidate Selection
-- [ ] Replace leaderboard-driven candidate selection with TS-based explore/exploit
-- [ ] Invoke `select_traders_with_exploration()` in hl-scout/hl-sage pipeline
+- [ ] Replace posterior-mean ranking with actual Thompson Sampling
+- [ ] Invoke `thompson_sample_select_nig()` in hl-sage score emission
 - [ ] Configure exploration_ratio for new trader discovery
+- [ ] Add uncertainty bonus for traders with low κ (few observations)
 
 #### 3.5 Daily Correlation Job
 - [ ] Compute 5-minute bucket sign vectors per trader
 - [ ] Calculate pairwise correlation from co-occurrence
 - [ ] Store in `trader_corr` table (already migrated)
+- [ ] Hydrate `ConsensusDetector.correlation_matrix` on startup
 - [ ] Prune entries older than 30 days
 
-#### 3.6 Episode-Based Votes
+#### 3.6 Dynamic Risk Inputs
+- [ ] Add ATR calculation from `marks_1m` price history
+- [ ] Replace hardcoded 1% stop with ATR-based stop distance
+- [ ] Pass dynamic stop_bps to consensus gates
+- [ ] Consider regime-specific ATR multipliers
+
+#### 3.7 Episode-Based Votes
 - [ ] hl-decide consumes episodes from ts-lib
 - [ ] One vote per trader derived from episode state, not individual fills
 - [ ] Weight votes by position conviction (size/equity)

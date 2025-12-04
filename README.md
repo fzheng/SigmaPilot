@@ -10,12 +10,14 @@
 
 - **Scans Top Traders**: Continuously monitors 1000+ traders on Hyperliquid leaderboard
 - **Quality Filtering**: Removes losers, HFT bots, and inactive accounts with 7 quality gates
-- **Alpha Pool**: NIG-based Thompson Sampling selects top 50 qualified traders with Bayesian confidence
+- **Alpha Pool**: Selects top 50 qualified traders ranked by NIG posterior mean
 - **Real-time Tracking**: Monitors positions and trades of top performers live
 - **Pin Favorites**: Pin accounts from leaderboard or add custom addresses to track
 - **Consensus Signals**: Generates trading signals when multiple Alpha Pool traders agree
 - **5-Gate Validation**: Supermajority, independence (effK), freshness, drift, and EV gates
-- **Self-Learning**: Updates trader posteriors from realized R-multiples (coming soon)
+- **Self-Learning**: Updates trader posteriors from realized R-multiples
+
+> **Development Status**: Core infrastructure complete. Thompson Sampling exploration and dynamic risk inputs are planned for Phase 3b. See [Development Plan](docs/DEVELOPMENT_PLAN.md) for details.
 
 ### Alpha Pool Quality Filters
 
@@ -74,11 +76,13 @@ npm run test:coverage # Jest with coverage report
 npm run e2e-smoke     # End-to-end smoke test
 ```
 
-**E2E Prerequisites**: Before running Playwright tests, start the dashboard:
+**E2E Prerequisites**: Playwright tests require a running dashboard:
 ```bash
-docker compose up -d hl-stream
-npx playwright install chromium  # First time only
+docker compose up -d              # Start all services including dashboard
+npx playwright install chromium   # First time only
+npm run test:e2e                  # Run E2E tests
 ```
+> **Note**: The `webServer` in `playwright.config.ts` is currently disabled. Tests expect the dashboard at `http://localhost:4102/dashboard`.
 
 ## Documentation
 
