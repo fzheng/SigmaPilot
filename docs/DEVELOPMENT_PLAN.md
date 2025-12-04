@@ -445,6 +445,36 @@ The following gaps exist between the documented design and current implementatio
 **Impact**: UI regressions won't be caught in CI; only unit-level algorithm tests run.
 **Fix**: Add Docker-based E2E stage to CI or document that E2E is manual-only.
 
+### Quant Review Watchpoints (December 2025)
+
+The following areas require careful attention during Phase 3b implementation:
+
+1. **Volatility Inputs**: EV gate, price-band gate, and latency calculations depend on ATR or similar. Must source/refresh real volatility data, not fixed constants. Consider per-asset ATR from `marks_1m`.
+
+2. **Correlation Estimation**: effK needs live pairwise correlations; default ρ=0.3 is only a fallback. Define:
+   - Window size for correlation calculation (e.g., 30 days)
+   - Decay mechanism for stale correlations
+   - Asset-specific vs cross-asset correlations
+   - Regime-aware correlation adjustments
+
+3. **Stop/Risk Policy**: Fixed 1% stops are not robust across market conditions. Tie stop distance to:
+   - ATR multiplier (e.g., 2× ATR for BTC, 1.5× for ETH)
+   - Regime-specific multipliers (trending vs ranging vs volatile)
+
+4. **Vote Weighting**: Weights should reflect notional/equity risk, not raw size counts. Define:
+   - Normalization: `position_notional / account_equity`
+   - Caps based on risk contribution, not arbitrary size=1.0
+
+5. **Explore/Exploit Balance**: Thompson Sampling must drive selection in production. Mean-only rankings miss:
+   - Uncertainty quantification (wide posteriors should explore)
+   - Adaptation to changing trader performance
+   - New trader discovery
+
+6. **Data Hygiene**: Position episodes need tight validation:
+   - No overlapping fills within same episode
+   - Sign flips correctly split episodes (close + reopen)
+   - Entry/exit timestamps match fill sequences
+
 ### Remaining Integration Tasks (Phase 3b)
 
 #### 3.4 Thompson Sampling for Candidate Selection
@@ -473,6 +503,24 @@ The following gaps exist between the documented design and current implementatio
 - [ ] Calculate R-multiples on position close and update NIG posteriors
 - [ ] Normalize vote weights by notional/equity (not just clamped abs(net_delta))
 - [ ] Track position entry/exit for proper R calculation
+- [ ] Validate episode data hygiene (no overlaps, sign flips split correctly)
+
+#### 3.8 Testing & CI Hardening
+- [ ] Add integration tests for Thompson Sampling selection path
+- [ ] Add integration tests for consensus with real correlation/ATR
+- [ ] Add integration tests for episode construction and R calculation
+- [ ] Tighten Playwright assertions if keeping E2E tests
+- [ ] Document runbook: what drives selection, how corr/ATR sourced, migration ops
+
+### Suggested Implementation Order (Priority)
+
+Based on quant review, recommended sequence for Phase 3b:
+
+1. **Episode Integration** (3.7) - Foundation for R-multiples and NIG updates
+2. **Thompson Sampling** (3.4) - Enable explore/exploit in production
+3. **Dynamic Risk/ATR** (3.6) - Real volatility for EV/price gates
+4. **Correlation Job** (3.5) - Real effK for independence gate
+5. **Testing/CI** (3.8) - Validate all paths work correctly
 
 ### Environment Variables
 ```bash
