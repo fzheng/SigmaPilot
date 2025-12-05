@@ -55,7 +55,7 @@ services:
       PORT: 8080
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
-      NATS_URL: nats://nats:4222
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
       SERVICE_NAME: hl-scout
     depends_on:
       postgres:
@@ -81,8 +81,8 @@ services:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: 8080
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
-      NATS_URL: nats://nats:4222
-      SCOUT_URL: http://hl-scout:8080
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      SCOUT_URL: ${SCOUT_URL:-http://hl-scout:8080}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
       SERVICE_NAME: hl-stream
     depends_on:
@@ -110,7 +110,7 @@ services:
     environment:
       PORT: 8080
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
-      NATS_URL: nats://nats:4222
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
       SERVICE_NAME: hl-sage
     depends_on:
@@ -136,7 +136,7 @@ services:
     environment:
       PORT: 8080
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
-      NATS_URL: nats://nats:4222
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
       SERVICE_NAME: hl-decide
     depends_on:
