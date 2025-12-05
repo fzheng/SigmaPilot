@@ -2,8 +2,14 @@
 -- Stores periodic BTC/ETH mark prices for calculating moving averages and ATR
 -- Used by market regime detection (trending/ranging/volatile)
 
--- marks_1m already exists in 001_base.sql, just ensure indexes
--- Table structure: asset, ts, mid, atr14
+-- Ensure marks_1m table exists (may already exist from 000_base_schema.sql or docker init)
+CREATE TABLE IF NOT EXISTS marks_1m (
+  asset TEXT NOT NULL,
+  ts TIMESTAMPTZ NOT NULL,
+  mid NUMERIC NOT NULL,
+  atr14 NUMERIC,
+  PRIMARY KEY(asset, ts)
+);
 
 -- Index for efficient lookups by asset and time range
 CREATE INDEX IF NOT EXISTS marks_1m_asset_ts_desc_idx
