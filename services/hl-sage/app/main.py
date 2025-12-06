@@ -245,22 +245,48 @@ async def handle_fill(msg):
     # Fetch NIG posterior for this trader (if available)
     nig_params = await get_trader_nig_params(addr_lower)
 
-    # Use NIG posterior mean as score if available, else fall back to leaderboard weight
+    # Thompson Sampling: sample from NIG posterior instead of using mean
+    # This enables explore/exploit tradeoff - uncertain traders (low κ) get
+    # wider samples, sometimes ranking higher than proven performers.
     if nig_params and nig_params.get("nig_m") is not None:
-        # NIG-based score: posterior mean * direction
-        nig_score = nig_params["nig_m"] * side_multiplier
+        # Create TraderPosteriorNIG for sampling
+        from .bandit import TraderPosteriorNIG
+
+        posterior = TraderPosteriorNIG(
+            address=addr_lower,
+            m=nig_params["nig_m"],
+            kappa=nig_params["nig_kappa"],
+            alpha=nig_params["nig_alpha"],
+            beta=nig_params["nig_beta"],
+            total_signals=nig_params["total_signals"],
+            total_pnl_r=nig_params.get("total_pnl_r", 0.0),
+        )
+
+        # Thompson sample from posterior (explore/exploit)
+        sampled_mu = posterior.sample()
+
+        # Apply direction to sampled value
+        nig_score = sampled_mu * side_multiplier
         # Clamp to [-1, 1] range
         base_score = max(-1.0, min(1.0, nig_score))
-        score_source = "nig"
+        score_source = "thompson"
+
+        # Derive weight from NIG confidence: κ/(κ+10)
+        # This gives weight ~0.09 for κ=1 (new trader), ~0.5 for κ=10, ~0.91 for κ=100
+        nig_weight = nig_params["nig_kappa"] / (nig_params["nig_kappa"] + 10.0)
     else:
         # Legacy: leaderboard weight * direction
         base_score = max(-1.0, min(1.0, state["weight"] * side_multiplier))
         score_source = "leaderboard"
+        nig_weight = None
+
+    # Use NIG-derived weight when available, else legacy weight
+    score_weight = nig_weight if nig_weight is not None else state["weight"]
 
     event = ScoreEvent(
         address=data.address,
         score=base_score,
-        weight=state["weight"],
+        weight=score_weight,
         rank=state["rank"],
         window_s=60,
         ts=datetime.now(timezone.utc),
@@ -271,6 +297,8 @@ async def handle_fill(msg):
             "fill": data.model_dump(),
             # Include NIG params for hl-decide consensus detection
             "nig": nig_params if nig_params else None,
+            # Include sampled value for debugging/audit
+            "thompson_sample": sampled_mu if score_source == "thompson" else None,
         },
     )
 
@@ -294,7 +322,7 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
         address: Trader's Ethereum address (lowercase)
 
     Returns:
-        Dict with nig_m, nig_kappa, nig_alpha, nig_beta, total_signals, avg_r
+        Dict with nig_m, nig_kappa, nig_alpha, nig_beta, total_signals, avg_r, total_pnl_r
         or None if trader has no posterior data
     """
     try:
@@ -302,7 +330,7 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
             row = await conn.fetchrow(
                 """
                 SELECT nig_m, nig_kappa, nig_alpha, nig_beta,
-                       total_signals, avg_r
+                       total_signals, avg_r, total_pnl_r
                 FROM trader_performance
                 WHERE address = $1
                 """,
@@ -316,6 +344,7 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
                     "nig_beta": float(row["nig_beta"]),
                     "total_signals": int(row["total_signals"] or 0),
                     "avg_r": float(row["avg_r"] or 0),
+                    "total_pnl_r": float(row["total_pnl_r"] or 0),
                 }
     except Exception as e:
         print(f"[hl-sage] Failed to fetch NIG params for {address}: {e}")

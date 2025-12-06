@@ -1,0 +1,604 @@
+"""
+Integration Tests for Phase 3b Components.
+
+These tests verify that Thompson Sampling, ATR, Correlation, and Episode
+features work correctly when integrated together.
+
+Key integration points:
+1. Thompson Sampling → Score → Consensus Detection
+2. ATR Provider → Dynamic Stop Fractions → Consensus Gates
+3. Correlation → effK Calculation → Signal Threshold
+4. Episode Builder → R-Multiple → NIG Update
+"""
+import pytest
+from datetime import datetime, timezone, timedelta, date
+from unittest.mock import AsyncMock, MagicMock, patch
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from app.consensus import ConsensusDetector, ConsensusSignal, Fill
+from app.atr import (
+    ATRProvider,
+    ATRData,
+    calculate_true_range,
+    calculate_atr,
+    Candle,
+    ATR_MULTIPLIER_BTC,
+    ATR_MULTIPLIER_ETH,
+)
+from app.correlation import (
+    compute_phi_correlation,
+    bucket_id_from_timestamp,
+    TraderSignVector,
+    CorrelationProvider,
+    CORR_MIN_COMMON_BUCKETS,
+)
+from app.episode import EpisodeTracker, EpisodeBuilderConfig, Episode, EpisodeFill
+
+
+class TestThompsonSamplingToConsensus:
+    """Test Thompson Sampling integration with consensus detection."""
+
+    def _make_fill(self, address: str, asset: str, side: str, size: float, price: float, ts: datetime) -> Fill:
+        """Helper to create a fill."""
+        return Fill(
+            fill_id=f"fill-{ts.timestamp()}",
+            address=address,
+            asset=asset,
+            side=side,
+            size=size,
+            price=price,
+            ts=ts,
+        )
+
+    def test_fills_are_processed_by_consensus_detector(self):
+        """
+        Fills (which come from Thompson-sampled score events) should be
+        processed by the consensus detector and accumulated in windows.
+        """
+        detector = ConsensusDetector()
+        now = datetime.now(timezone.utc)
+
+        # Simulate 3 traders with long fills
+        for addr in ["0x1111", "0x2222", "0x3333"]:
+            fill = self._make_fill(addr, "BTC", "buy", 1.0, 100000.0, now)
+            detector.process_fill(fill)
+
+        # Check window has accumulated fills
+        window = detector.windows.get("BTC")
+        assert window is not None
+        assert len(window.fills) == 3
+
+    def test_nig_weight_formula_verification(self):
+        """
+        Verify NIG weight formula: κ/(κ+10).
+        High-κ traders should contribute more weight than low-κ traders.
+        """
+        # Weight formula verification (used in hl-sage)
+        low_kappa = 1.0
+        high_kappa = 100.0
+
+        low_weight = low_kappa / (low_kappa + 10.0)
+        high_weight = high_kappa / (high_kappa + 10.0)
+
+        # Low κ = 1 → weight ~0.09
+        assert low_weight == pytest.approx(0.0909, rel=0.01)
+
+        # High κ = 100 → weight ~0.91
+        assert high_weight == pytest.approx(0.909, rel=0.01)
+
+        # High-confidence trader has 10x more weight
+        assert high_weight > low_weight * 9
+
+    def test_multiple_fills_same_direction_consensus(self):
+        """
+        When multiple traders vote the same direction,
+        consensus detector should aggregate them correctly.
+        """
+        detector = ConsensusDetector()
+        now = datetime.now(timezone.utc)
+
+        # All traders go long on ETH
+        for i, addr in enumerate(["0x1111", "0x2222", "0x3333"]):
+            fill = self._make_fill(addr, "ETH", "buy", 1.0 + i * 0.5, 4000.0, now + timedelta(seconds=i))
+            detector.process_fill(fill)
+
+        window = detector.windows.get("ETH")
+        votes = detector.collapse_to_votes(window.fills)
+
+        # All 3 should have voted long
+        directions = [v.direction for v in votes]
+        assert directions == ["long", "long", "long"]
+
+
+class TestATRDynamicStops:
+    """Test ATR integration with consensus stop distances."""
+
+    def test_atr_sets_stop_fraction_for_consensus(self):
+        """ATRProvider should provide stop fractions that ConsensusDetector uses."""
+        provider = ATRProvider()
+
+        # Create ATR data (2% ATR with 2x multiplier = 4% stop)
+        atr_data = ATRData(
+            asset="BTC",
+            atr=2000.0,
+            atr_pct=2.0,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=4.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+        )
+
+        stop_fraction = provider.get_stop_fraction(atr_data)
+        assert stop_fraction == pytest.approx(0.04, rel=1e-5)
+
+        # Apply to consensus detector
+        detector = ConsensusDetector()
+        detector.set_stop_fraction("BTC", stop_fraction)
+        assert detector.get_stop_fraction("BTC") == 0.04
+
+    def test_high_volatility_widens_stops(self):
+        """During high volatility (high ATR), stops should widen."""
+        provider = ATRProvider()
+
+        # High volatility: 5% ATR
+        high_vol = ATRData(
+            asset="BTC",
+            atr=5000.0,
+            atr_pct=5.0,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=10.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+        )
+
+        # Low volatility: 0.5% ATR
+        low_vol = ATRData(
+            asset="BTC",
+            atr=500.0,
+            atr_pct=0.5,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=1.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+        )
+
+        high_stop = provider.get_stop_fraction(high_vol)
+        low_stop = provider.get_stop_fraction(low_vol)
+
+        # High volatility should have 10x wider stops
+        assert high_stop / low_stop == pytest.approx(10.0, rel=0.01)
+
+    def test_stop_fraction_bounds_in_detector(self):
+        """Detector should bound extreme stop fractions."""
+        detector = ConsensusDetector()
+
+        # Try to set extremely low stop (0.01%)
+        detector.set_stop_fraction("BTC", 0.0001)
+        assert detector.get_stop_fraction("BTC") == 0.001  # Bounded to 0.1%
+
+        # Try to set extremely high stop (20%)
+        detector.set_stop_fraction("BTC", 0.20)
+        assert detector.get_stop_fraction("BTC") == 0.10  # Bounded to 10%
+
+
+class TestCorrelationEffK:
+    """Test correlation integration with effective-K calculation."""
+
+    def test_correlation_hydrates_detector(self):
+        """CorrelationProvider should populate detector's correlation matrix."""
+        provider = CorrelationProvider()
+        detector = ConsensusDetector()
+
+        # Manually set correlations
+        provider.correlations[("0x1111", "0x2222")] = 0.5
+        provider.correlations[("0x1111", "0x3333")] = 0.3
+        provider.correlations[("0x2222", "0x3333")] = 0.4
+
+        # Hydrate detector
+        count = provider.hydrate_detector(detector)
+        assert count == 3
+
+        # Verify detector has the correlations in its matrix
+        key1 = tuple(sorted(["0x1111", "0x2222"]))
+        key2 = tuple(sorted(["0x1111", "0x3333"]))
+        key3 = tuple(sorted(["0x2222", "0x3333"]))
+        assert detector.correlation_matrix[key1] == 0.5
+        assert detector.correlation_matrix[key2] == 0.3
+        assert detector.correlation_matrix[key3] == 0.4
+
+    def test_high_correlation_reduces_effk(self):
+        """Highly correlated traders should have lower effective-K."""
+        detector = ConsensusDetector()
+
+        # All pairs highly correlated (rho=0.8)
+        detector.update_correlation("0x1111", "0x2222", 0.8)
+        detector.update_correlation("0x1111", "0x3333", 0.8)
+        detector.update_correlation("0x2222", "0x3333", 0.8)
+
+        weights = {"0x1111": 1.0, "0x2222": 1.0, "0x3333": 1.0}
+        eff_k = detector.eff_k_from_corr(weights)
+
+        # With rho=0.8: effK = 9 / (3 + 6*0.8) = 9/7.8 ≈ 1.15
+        assert eff_k < 1.5
+        assert eff_k > 1.0
+
+    def test_independent_traders_full_effk(self):
+        """Independent traders (rho=0) should have effK = n."""
+        detector = ConsensusDetector()
+
+        # All pairs independent
+        detector.update_correlation("0x1111", "0x2222", 0.0)
+        detector.update_correlation("0x1111", "0x3333", 0.0)
+        detector.update_correlation("0x2222", "0x3333", 0.0)
+
+        weights = {"0x1111": 1.0, "0x2222": 1.0, "0x3333": 1.0}
+        eff_k = detector.eff_k_from_corr(weights)
+
+        # With rho=0: effK = 9/3 = 3
+        assert eff_k == pytest.approx(3.0, rel=0.01)
+
+    def test_correlation_affects_effk_calculation(self):
+        """Higher correlation should result in lower effective-K for same weights."""
+        # High correlation scenario
+        detector_high = ConsensusDetector()
+        detector_high.update_correlation("0x1111", "0x2222", 0.9)
+        detector_high.update_correlation("0x1111", "0x3333", 0.9)
+        detector_high.update_correlation("0x2222", "0x3333", 0.9)
+
+        # Low correlation scenario
+        detector_low = ConsensusDetector()
+        detector_low.update_correlation("0x1111", "0x2222", 0.1)
+        detector_low.update_correlation("0x1111", "0x3333", 0.1)
+        detector_low.update_correlation("0x2222", "0x3333", 0.1)
+
+        # Same 3 weights for both
+        weights = {"0x1111": 1.0, "0x2222": 1.0, "0x3333": 1.0}
+
+        # effK should be lower for high correlation
+        effk_high = detector_high.eff_k_from_corr(weights)
+        effk_low = detector_low.eff_k_from_corr(weights)
+
+        # High correlation = lower effective independent traders
+        assert effk_high < effk_low
+        # With ρ=0.9: effK ≈ 9/(3+6*0.9) = 9/8.4 ≈ 1.07
+        # With ρ=0.1: effK ≈ 9/(3+6*0.1) = 9/3.6 ≈ 2.5
+        assert effk_high < 1.5
+        assert effk_low > 2.0
+
+
+class TestEpisodeRMultiple:
+    """Test episode construction and R-multiple calculation."""
+
+    def _make_fill(self, address: str, asset: str, side: str, px: float, sz: float, ts: datetime, fee: float = 0.0) -> EpisodeFill:
+        """Helper to create a fill."""
+        return EpisodeFill(
+            fill_id=f"fill-{ts.timestamp()}",
+            address=address,
+            asset=asset,
+            side=side,
+            size=sz,
+            price=px,
+            ts=ts,
+            fees=fee,
+        )
+
+    def test_episode_r_multiple_with_dynamic_stop(self):
+        """
+        Episode R-multiple should be calculated using ATR-based stop.
+
+        Entry: $100k
+        Exit: $103k (3% profit)
+        ATR-based stop: 2%
+        R = 3% / 2% = 1.5R
+        """
+        config = EpisodeBuilderConfig(default_stop_fraction=0.02)  # 2% ATR-based
+        tracker = EpisodeTracker(config)
+
+        now = datetime.now(timezone.utc)
+
+        # Entry fill (opens position)
+        entry_fill = self._make_fill("0xtest", "BTC", "buy", px=100000.0, sz=1.0, ts=now, fee=10.0)
+        result = tracker.process_fill(entry_fill)
+        assert result is None  # Not closed yet
+
+        # Exit fill (closes position) - 3% profit
+        exit_fill = self._make_fill("0xtest", "BTC", "sell", px=103000.0, sz=1.0, ts=now + timedelta(hours=1), fee=10.0)
+        episode = tracker.process_fill(exit_fill)
+
+        # Episode should be closed with R calculated
+        # PnL = (103000 - 100000) * 1 - 20 fees = 2980
+        # Risk = 100000 * 0.02 = 2000
+        # R = 2980 / 2000 = 1.49
+        assert episode is not None
+        assert episode.status == 'closed'
+        assert episode.result_r == pytest.approx(1.49, rel=0.05)
+
+    def test_episode_with_vwap_entry(self):
+        """
+        VWAP entry calculation across multiple fills.
+        """
+        config = EpisodeBuilderConfig(default_stop_fraction=0.01)
+        tracker = EpisodeTracker(config)
+
+        now = datetime.now(timezone.utc)
+
+        # First entry fill at $4000 for 2 ETH
+        fill1 = self._make_fill("0xtest", "ETH", "buy", px=4000.0, sz=2.0, ts=now, fee=5.0)
+        tracker.process_fill(fill1)
+
+        # Check open episode
+        key = ("0xtest", "ETH")
+        open_ep = tracker.open_episodes.get(key)
+        assert open_ep is not None
+        assert open_ep.entry_vwap == 4000.0
+
+        # Second entry fill at $4100 for 3 ETH (add to position)
+        fill2 = self._make_fill("0xtest", "ETH", "buy", px=4100.0, sz=3.0, ts=now + timedelta(minutes=1), fee=7.5)
+        tracker.process_fill(fill2)
+
+        # Check that VWAP is recalculated
+        open_ep = tracker.open_episodes.get(key)
+        # VWAP = (4000*2 + 4100*3) / 5 = (8000 + 12300) / 5 = 4060
+        assert open_ep.entry_vwap == pytest.approx(4060.0, rel=0.01)
+
+    def test_episode_r_feeds_nig_update(self):
+        """
+        Episode R-multiple should be suitable for NIG posterior update.
+        The R value represents standardized performance that can be
+        compared across different volatility regimes.
+        """
+        config = EpisodeBuilderConfig(default_stop_fraction=0.02)
+
+        now = datetime.now(timezone.utc)
+
+        # Winning episode
+        tracker_win = EpisodeTracker(config)
+        tracker_win.process_fill(self._make_fill("0xwinner", "BTC", "buy", 100000.0, 1.0, now, 10.0))
+        win_episode = tracker_win.process_fill(self._make_fill("0xwinner", "BTC", "sell", 104000.0, 1.0, now + timedelta(hours=1), 10.0))
+
+        # Losing episode
+        tracker_lose = EpisodeTracker(config)
+        tracker_lose.process_fill(self._make_fill("0xloser", "BTC", "buy", 100000.0, 1.0, now, 10.0))
+        lose_episode = tracker_lose.process_fill(self._make_fill("0xloser", "BTC", "sell", 98000.0, 1.0, now + timedelta(hours=1), 10.0))
+
+        # Winner should have positive R (profit > 1R)
+        # PnL = 4000 - 20 = 3980, R = 3980/2000 = 1.99
+        assert win_episode.result_r > 1.0
+
+        # Loser should have negative R (lost 2% + fees)
+        # PnL = -2000 - 20 = -2020, R = -2020/2000 = -1.01
+        assert lose_episode.result_r < 0
+
+
+class TestEndToEndSignalFlow:
+    """Test complete signal flow from score to episode."""
+
+    def _make_fill(self, address: str, asset: str, side: str, px: float, sz: float, ts: datetime, fee: float = 0.0) -> EpisodeFill:
+        """Helper to create a fill."""
+        return EpisodeFill(
+            fill_id=f"fill-{ts.timestamp()}",
+            address=address,
+            asset=asset,
+            side=side,
+            size=sz,
+            price=px,
+            ts=ts,
+            fees=fee,
+        )
+
+    def test_complete_long_signal_flow(self):
+        """
+        End-to-end test:
+        1. Multiple traders vote long (from Thompson Sampling)
+        2. Consensus detected with correlation-adjusted effK
+        3. Signal generated with ATR-based stop
+        4. Episode created and R-multiple calculated
+        """
+        # Setup correlation provider
+        corr_provider = CorrelationProvider()
+        corr_provider.correlations[("0x1111", "0x2222")] = 0.3
+        corr_provider.correlations[("0x1111", "0x3333")] = 0.2
+        corr_provider.correlations[("0x2222", "0x3333")] = 0.4
+
+        # Setup consensus detector with ATR-based stop
+        detector = ConsensusDetector()
+        corr_provider.hydrate_detector(detector)
+        detector.set_stop_fraction("BTC", 0.025)
+
+        # Verify effK calculation with loaded correlations
+        weights = {"0x1111": 1.0, "0x2222": 1.0, "0x3333": 1.0}
+        eff_k = detector.eff_k_from_corr(weights)
+        # With avg correlation ~0.3: effK = 9/(3+6*0.3) = 9/4.8 = 1.875
+        # Should be between 1 and 3
+        assert 1.0 < eff_k < 3.0
+        assert eff_k == pytest.approx(1.875, rel=0.05)
+
+        # Create episode with the ATR-based stop (simulating signal execution)
+        config = EpisodeBuilderConfig(
+            default_stop_fraction=detector.get_stop_fraction("BTC")
+        )
+        tracker = EpisodeTracker(config)
+
+        now = datetime.now(timezone.utc)
+
+        # Simulate fills based on hypothetical consensus signal
+        tracker.process_fill(self._make_fill("0xpool", "BTC", "buy", 100000.0, 1.0, now, 10.0))
+
+        # Price moves in our favor by 3.75% (1.5R with 2.5% stop)
+        episode = tracker.process_fill(self._make_fill("0xpool", "BTC", "sell", 103750.0, 1.0, now + timedelta(hours=4), 10.0))
+
+        assert episode is not None
+        # R = (3750 - 20 fees) / 2500 risk ≈ 1.49R
+        assert episode.result_r == pytest.approx(1.49, rel=0.05)
+
+    def test_regime_shift_changes_stops(self):
+        """
+        When volatility regime shifts (ATR changes), stops should adapt.
+        Low vol regime: tight stops, higher R
+        High vol regime: wide stops, more room but lower R multiple for same move
+        """
+        now = datetime.now(timezone.utc)
+
+        # Low volatility regime (1% ATR → 2% stop with 2x multiplier)
+        low_vol_config = EpisodeBuilderConfig(default_stop_fraction=0.02)
+        tracker_low = EpisodeTracker(low_vol_config)
+        tracker_low.process_fill(self._make_fill("0x1", "BTC", "buy", 100000.0, 1.0, now, 10.0))
+        episode_low = tracker_low.process_fill(self._make_fill("0x1", "BTC", "sell", 102000.0, 1.0, now + timedelta(hours=1), 10.0))
+
+        # High volatility regime (4% ATR → 8% stop with 2x multiplier)
+        high_vol_config = EpisodeBuilderConfig(default_stop_fraction=0.08)
+        tracker_high = EpisodeTracker(high_vol_config)
+        tracker_high.process_fill(self._make_fill("0x2", "BTC", "buy", 100000.0, 1.0, now, 10.0))
+        episode_high = tracker_high.process_fill(self._make_fill("0x2", "BTC", "sell", 102000.0, 1.0, now + timedelta(hours=1), 10.0))
+
+        # Same $2000 profit, but different R multiples due to stop size
+        # Low vol: R = 1980 / 2000 ≈ 0.99R
+        # High vol: R = 1980 / 8000 ≈ 0.25R
+        assert episode_low.result_r > episode_high.result_r
+        assert episode_low.result_r == pytest.approx(0.99, rel=0.05)
+        assert episode_high.result_r == pytest.approx(0.25, rel=0.05)
+
+
+class TestCorrelationSignVectorIntegration:
+    """Test sign vector correlation with consensus votes."""
+
+    def test_same_direction_votes_high_correlation(self):
+        """
+        Traders who consistently vote the same direction should have
+        high correlation in their sign vectors.
+        """
+        # Build sign vectors with same pattern
+        signs_a = {i: 1 for i in range(20)}  # All long
+        signs_b = {i: 1 for i in range(20)}  # All long
+
+        rho, n_common = compute_phi_correlation(signs_a, signs_b)
+
+        assert rho == 1.0
+        assert n_common == 20
+
+    def test_opposite_direction_votes_zero_correlation(self):
+        """
+        Traders who vote opposite directions should have
+        zero correlation (clipped from negative).
+        """
+        signs_a = {i: 1 for i in range(20)}   # All long
+        signs_b = {i: -1 for i in range(20)}  # All short
+
+        rho, n_common = compute_phi_correlation(signs_a, signs_b)
+
+        assert rho == 0.0  # Clipped
+        assert n_common == 20
+
+    def test_bucket_alignment_for_concurrent_votes(self):
+        """
+        Votes within 5 minutes should fall in the same bucket,
+        contributing to correlation calculation.
+        """
+        t1 = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        t2 = datetime(2024, 6, 15, 12, 3, 0, tzinfo=timezone.utc)  # Same bucket
+        t3 = datetime(2024, 6, 15, 12, 6, 0, tzinfo=timezone.utc)  # Next bucket
+
+        b1 = bucket_id_from_timestamp(t1)
+        b2 = bucket_id_from_timestamp(t2)
+        b3 = bucket_id_from_timestamp(t3)
+
+        assert b1 == b2  # Same 5-min bucket
+        assert b1 != b3  # Different bucket
+
+
+class TestDataFlowValidation:
+    """Validate data flows correctly between components."""
+
+    def test_atr_data_format(self):
+        """ATR data should have all required fields."""
+        atr_data = ATRData(
+            asset="BTC",
+            atr=1500.0,
+            atr_pct=1.5,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=3.0,
+            timestamp=datetime.now(timezone.utc),
+            source="calculated",
+        )
+
+        # Verify all fields present
+        assert atr_data.asset == "BTC"
+        assert atr_data.atr == 1500.0
+        assert atr_data.multiplier == ATR_MULTIPLIER_BTC
+        assert atr_data.source in ["db", "calculated", "fallback"]
+
+    def test_correlation_lookup_symmetric(self):
+        """Correlation lookup should be symmetric (ρ(A,B) = ρ(B,A))."""
+        provider = CorrelationProvider()
+        provider.correlations[("0x1111", "0x2222")] = 0.5
+
+        # Both orderings should return same value
+        assert provider.get("0x1111", "0x2222") == 0.5
+        assert provider.get("0x2222", "0x1111") == 0.5
+
+    def test_detector_correlation_symmetric(self):
+        """ConsensusDetector correlation should be symmetric (stored with sorted key)."""
+        detector = ConsensusDetector()
+        detector.update_correlation("0x1111", "0x2222", 0.6)
+
+        # Both orderings should access the same stored value
+        key1 = tuple(sorted(["0x1111", "0x2222"]))
+        key2 = tuple(sorted(["0x2222", "0x1111"]))
+        assert key1 == key2  # Keys should be identical
+        assert detector.correlation_matrix[key1] == 0.6
+
+    def test_episode_data_serializable(self):
+        """Episode data should be JSON-serializable for persistence."""
+        import json
+
+        config = EpisodeBuilderConfig(default_stop_fraction=0.02)
+        tracker = EpisodeTracker(config)
+
+        now = datetime.now(timezone.utc)
+        entry_fill = EpisodeFill(
+            fill_id="f1",
+            address="0xtest",
+            asset="BTC",
+            side="buy",
+            size=1.0,
+            price=100000.0,
+            ts=now,
+            fees=10.0,
+        )
+        exit_fill = EpisodeFill(
+            fill_id="f2",
+            address="0xtest",
+            asset="BTC",
+            side="sell",
+            size=1.0,
+            price=101000.0,
+            ts=now + timedelta(hours=1),
+            fees=10.0,
+        )
+
+        tracker.process_fill(entry_fill)
+        episode = tracker.process_fill(exit_fill)
+
+        # Should be able to create a serializable dict
+        episode_dict = {
+            "episode_id": episode.id,
+            "address": episode.address,
+            "asset": episode.asset,
+            "direction": episode.direction,
+            "entry_vwap": episode.entry_vwap,
+            "exit_vwap": episode.exit_vwap,
+            "pnl": episode.realized_pnl,
+            "r_multiple": episode.result_r,
+        }
+
+        # Should serialize without error
+        json_str = json.dumps(episode_dict)
+        assert "r_multiple" in json_str

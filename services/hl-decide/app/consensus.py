@@ -137,6 +137,11 @@ class ConsensusDetector:
         self.windows: Dict[str, ConsensusWindow] = {}
         self.correlation_matrix: Dict[Tuple[str, str], float] = {}
         self.current_prices: Dict[str, float] = {}
+        # ATR-based stop fractions per asset (updated by ATR provider)
+        self.stop_fractions: Dict[str, float] = {
+            "BTC": 0.01,  # Default 1%, will be updated by ATR provider
+            "ETH": 0.01,
+        }
 
     def set_current_price(self, symbol: str, price: float) -> None:
         """Update current mid price for a symbol."""
@@ -145,6 +150,23 @@ class ConsensusDetector:
     def get_current_mid(self, symbol: str) -> float:
         """Get current mid price for a symbol."""
         return self.current_prices.get(symbol, 0.0)
+
+    def set_stop_fraction(self, symbol: str, stop_fraction: float) -> None:
+        """
+        Update ATR-based stop fraction for a symbol.
+
+        Called by ATR provider when new ATR data is available.
+        Stop fraction = ATR × multiplier / price
+
+        Args:
+            symbol: Asset symbol (BTC, ETH)
+            stop_fraction: Stop distance as fraction (0.01 = 1%)
+        """
+        self.stop_fractions[symbol.upper()] = max(0.001, min(0.10, stop_fraction))
+
+    def get_stop_fraction(self, symbol: str) -> float:
+        """Get current stop fraction for a symbol (default 1%)."""
+        return self.stop_fractions.get(symbol.upper(), 0.01)
 
     def update_correlation(self, addr1: str, addr2: str, correlation: float) -> None:
         """Update pairwise correlation between two traders."""
@@ -241,9 +263,10 @@ class ConsensusDetector:
         median_entry = statistics.median(v.price for v in agreeing_votes)
         mid_price = self.get_current_mid(symbol)
 
-        # Calculate stop price (simple ATR-based for now)
-        # TODO: Use actual ATR when available
-        stop_distance = median_entry * 0.01  # 1% as placeholder
+        # Calculate stop price using ATR-based stop fraction
+        # Stop fraction is updated by ATR provider based on current volatility
+        stop_fraction = self.get_stop_fraction(symbol)
+        stop_distance = median_entry * stop_fraction
         if majority_dir == "long":
             stop_price = median_entry - stop_distance
         else:
