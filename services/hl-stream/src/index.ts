@@ -107,6 +107,8 @@ const clients = new Set<{ ws: WebSocket; lastSeq: number; alive: boolean }>();
 let watchlist: string[] = [];
 /** URL of hl-scout service for API proxying */
 const scoutUrl = process.env.SCOUT_URL || 'http://hl-scout:8080';
+/** URL of hl-sage service for Alpha Pool data */
+const sageUrl = process.env.SAGE_URL || 'http://hl-sage:8080';
 /** Directory containing dashboard static files */
 const dashboardDir = path.resolve(__dirname, '..', 'public');
 /** NATS subject for fill events */
@@ -170,6 +172,11 @@ async function fetchWatchlist(): Promise<string[]> {
   } catch (err) {
     logger.warn('pinned_accounts_watchlist_failed', { err: err instanceof Error ? err.message : err });
   }
+
+  // NOTE: Alpha Pool addresses are NOT included in Legacy watchlist
+  // The two systems are intentionally separate:
+  // - Legacy: hl_leaderboard_entries + pinned_accounts (WebSocket real-time)
+  // - Alpha Pool: alpha_pool_addresses (backfill via hl-sage)
 
   if (addresses.length) return addresses;
 
@@ -434,7 +441,10 @@ async function main() {
     res.json({ ok: true, count: watchlist.length });
   });
   app.get('/dashboard/api/summary', (req, res) => proxyScout('/dashboard/summary', req, res));
+  // Deprecated: returns fills for ALL tracked addresses (use /legacy/fills for leaderboard-only)
   app.get('/dashboard/api/fills', (req, res) => proxyScout('/dashboard/fills', req, res));
+  // Legacy leaderboard fills - returns fills ONLY for leaderboard addresses + pinned accounts
+  app.get('/dashboard/api/legacy/fills', (req, res) => proxyScout('/dashboard/legacy/fills', req, res));
   app.get('/dashboard/api/decisions', (req, res) => proxyScout('/dashboard/decisions', req, res));
   app.get('/dashboard/api/price', (req, res) => proxyScout('/dashboard/price', req, res));
   app.get('/dashboard/api/positions-status', (_req, res) => res.json({
@@ -487,6 +497,20 @@ async function main() {
       });
       const body = await response.text();
       const type = response.headers.get('content-type') || 'application/json';
+
+      // After custom account is added successfully, refresh watchlist and prime positions
+      // This ensures holdings are available immediately instead of waiting for next refresh cycle
+      if (response.ok && tracker) {
+        try {
+          watchlist = await fetchWatchlist();
+          await tracker.refresh({ awaitPositions: true });
+          logger.info('watchlist_synced_after_custom_pinned', { count: watchlist.length });
+        } catch (syncErr: any) {
+          logger.warn('post_custom_pinned_sync_failed', { err: syncErr?.message });
+          // Don't fail the request, the account was added successfully
+        }
+      }
+
       res.status(response.status).setHeader('Content-Type', type).send(body);
     } catch (err: any) {
       logger.error('add_custom_pinned_proxy_failed', { err: err?.message });
@@ -589,7 +613,10 @@ async function main() {
       if (idx >= 0) {
         target.search = req.originalUrl.slice(idx);
       }
-      const response = await fetch(target, { headers: { 'x-owner-key': OWNER_TOKEN } });
+      const response = await fetch(target, {
+        method: req.method,
+        headers: { 'x-owner-key': OWNER_TOKEN },
+      });
       const body = await response.text();
       const type = response.headers.get('content-type') || 'application/json';
       res.status(response.status).setHeader('Content-Type', type).send(body);
@@ -608,7 +635,47 @@ async function main() {
   // Alpha Pool API routes (NIG-based Thompson Sampling)
   app.get('/dashboard/api/alpha-pool', (req, res) => proxySage('/alpha-pool', req, res));
   app.get('/dashboard/api/alpha-pool/status', (req, res) => proxySage('/alpha-pool/status', req, res));
+  app.get('/dashboard/api/alpha-pool/refresh/status', (req, res) => proxySage('/alpha-pool/refresh/status', req, res));
+  app.post('/dashboard/api/alpha-pool/refresh', (req, res) => proxySage('/alpha-pool/refresh', req, res));
   app.post('/dashboard/api/alpha-pool/sample', (req, res) => proxySage('/alpha-pool/sample', req, res));
+
+  // Alpha Pool fills endpoint - fetches fills for Alpha Pool addresses only
+  app.get('/dashboard/api/alpha-pool/fills', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    try {
+      const limit = req.query.limit ? Math.min(100, Math.max(1, parseInt(String(req.query.limit), 10))) : 50;
+      const beforeTime = req.query.before ? String(req.query.before) : null;
+
+      // Get Alpha Pool addresses from hl-sage
+      const alphaRes = await fetch(`${sageUrl}/alpha-pool/addresses?active_only=true&limit=500`);
+      if (!alphaRes.ok) {
+        return res.status(502).json({ error: 'Failed to fetch Alpha Pool addresses' });
+      }
+      const alphaData = await alphaRes.json();
+      const alphaAddresses = (alphaData?.addresses || []).map((a: any) => normalizeAddress(a.address));
+
+      if (alphaAddresses.length === 0) {
+        return res.json({ fills: [], hasMore: false, oldestTime: null });
+      }
+
+      // Fetch fills from database for Alpha Pool addresses
+      const result = await getBackfillFills({
+        beforeTime,
+        limit,
+        addresses: alphaAddresses
+      });
+
+      res.json({
+        fills: result.fills,
+        hasMore: result.hasMore,
+        oldestTime: result.oldestTime,
+        addressCount: alphaAddresses.length
+      });
+    } catch (err: any) {
+      logger.error('alpha_pool_fills_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Alpha Pool fills' });
+    }
+  });
 
   // Consensus signal API routes (hl-decide)
   const decideUrl = process.env.DECIDE_URL || 'http://hl-decide:8080';
@@ -633,8 +700,15 @@ async function main() {
   app.get('/dashboard/api/consensus/signals', (req, res) => proxyDecide('/consensus/signals', req, res));
   app.get('/dashboard/api/consensus/stats', (req, res) => proxyDecide('/consensus/stats', req, res));
 
-  // Backfill fills endpoint for infinite scroll
-  app.get('/dashboard/api/fills/backfill', async (req, res) => {
+  // =====================
+  // LEGACY TAB ENDPOINTS
+  // =====================
+  // These endpoints are ONLY for the Legacy Leaderboard tab.
+  // They use the Legacy watchlist (hl_leaderboard_entries + pinned_accounts).
+  // Alpha Pool has separate endpoints under /alpha-pool/*
+
+  // Legacy backfill fills endpoint for infinite scroll
+  app.get('/dashboard/api/legacy/fills/backfill', async (req, res) => {
     // Prevent browser caching - each request may return different data
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.set('Pragma', 'no-cache');
@@ -644,7 +718,7 @@ async function main() {
       const beforeTime = req.query.before ? String(req.query.before) : null;
       const limit = req.query.limit ? Math.min(100, Math.max(1, parseInt(String(req.query.limit), 10))) : 30;
 
-      // Get current watchlist addresses for filtering
+      // Get current Legacy watchlist addresses for filtering
       const addresses = watchlist.length > 0 ? watchlist : undefined;
 
       const result = await getBackfillFills({
@@ -659,31 +733,31 @@ async function main() {
         oldestTime: result.oldestTime
       });
     } catch (err: any) {
-      logger.error('backfill_fills_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to fetch backfill fills' });
+      logger.error('legacy_backfill_fills_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Legacy backfill fills' });
     }
   });
 
-  // Get oldest fill time for the current watchlist
-  app.get('/dashboard/api/fills/oldest', async (_req, res) => {
+  // Get oldest fill time for Legacy watchlist
+  app.get('/dashboard/api/legacy/fills/oldest', async (_req, res) => {
     try {
       const addresses = watchlist.length > 0 ? watchlist : undefined;
       const oldestTime = await getOldestFillTime(addresses);
       res.json({ oldestTime });
     } catch (err: any) {
-      logger.error('oldest_fill_time_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to get oldest fill time' });
+      logger.error('legacy_oldest_fill_time_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to get Legacy oldest fill time' });
     }
   });
 
-  // Fetch historical fills from Hyperliquid API and store in database
-  app.post('/dashboard/api/fills/fetch-history', async (req, res) => {
+  // Fetch historical fills from Hyperliquid API for Legacy watchlist
+  app.post('/dashboard/api/legacy/fills/fetch-history', async (req, res) => {
     try {
       const limit = req.body?.limit ? Math.min(100, Math.max(1, parseInt(String(req.body.limit), 10))) : 50;
       const addresses = watchlist.length > 0 ? watchlist : [];
 
       if (addresses.length === 0) {
-        return res.json({ inserted: 0, message: 'No addresses in watchlist' });
+        return res.json({ inserted: 0, message: 'No addresses in Legacy watchlist' });
       }
 
       let totalInserted = 0;
@@ -724,12 +798,12 @@ async function main() {
           results.push({ address, inserted });
           totalInserted += inserted;
         } catch (err: any) {
-          logger.warn('fetch_history_address_failed', { address, err: err?.message });
+          logger.warn('legacy_fetch_history_address_failed', { address, err: err?.message });
           results.push({ address, inserted: 0 });
         }
       }
 
-      logger.info('fetch_history_complete', { totalInserted, addressCount: addresses.length });
+      logger.info('legacy_fetch_history_complete', { totalInserted, addressCount: addresses.length });
 
       // Return the fills from DB after backfill
       const dbFills = await getBackfillFills({ limit: 40, addresses });
@@ -743,19 +817,19 @@ async function main() {
         oldestTime: dbFills.oldestTime
       });
     } catch (err: any) {
-      logger.error('fetch_history_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to fetch historical fills' });
+      logger.error('legacy_fetch_history_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Legacy historical fills' });
     }
   });
 
-  // Validate position chain integrity for all tracked addresses
-  app.get('/dashboard/api/fills/validate', async (req, res) => {
+  // Validate position chain integrity for Legacy watchlist addresses
+  app.get('/dashboard/api/legacy/fills/validate', async (req, res) => {
     try {
       const symbol = (req.query.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
       const addresses = watchlist.length > 0 ? watchlist : [];
 
       if (addresses.length === 0) {
-        return res.json({ valid: true, message: 'No addresses in watchlist', results: [] });
+        return res.json({ valid: true, message: 'No addresses in Legacy watchlist', results: [] });
       }
 
       const results: Array<{
@@ -779,7 +853,7 @@ async function main() {
       }
 
       const invalidCount = results.filter(r => !r.valid).length;
-      logger.info('position_chain_validation', { symbol, addressCount: addresses.length, invalidCount });
+      logger.info('legacy_position_chain_validation', { symbol, addressCount: addresses.length, invalidCount });
 
       res.json({
         valid: allValid,
@@ -789,13 +863,13 @@ async function main() {
         results: results.filter(r => !r.valid) // Only return invalid addresses
       });
     } catch (err: any) {
-      logger.error('validation_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to validate position chains' });
+      logger.error('legacy_validation_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to validate Legacy position chains' });
     }
   });
 
-  // Repair data for a specific address (clear and backfill)
-  app.post('/dashboard/api/fills/repair', async (req, res) => {
+  // Repair data for a specific address (clear and backfill) - Legacy
+  app.post('/dashboard/api/legacy/fills/repair', async (req, res) => {
     try {
       const address = req.body?.address;
       const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';

@@ -83,6 +83,7 @@ services:
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       SCOUT_URL: ${SCOUT_URL:-http://hl-scout:8080}
+      SAGE_URL: ${SAGE_URL:-http://hl-sage:8080}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
       SERVICE_NAME: hl-stream
     depends_on:
@@ -91,6 +92,8 @@ services:
       nats:
         condition: service_started
       hl-scout:
+        condition: service_started
+      hl-sage:
         condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
@@ -112,6 +115,7 @@ services:
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
+      DECIDE_URL: ${DECIDE_URL:-http://hl-decide:8080}
       SERVICE_NAME: hl-sage
     depends_on:
       postgres:

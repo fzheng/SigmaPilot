@@ -22,7 +22,7 @@ import asyncio
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from uuid import uuid4
 from collections import OrderedDict
 
@@ -48,6 +48,10 @@ NATS_URL = os.getenv("NATS_URL", "nats://0.0.0.0:4222")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@0.0.0.0:5432/hlbot")
 MAX_SCORES = int(os.getenv("MAX_SCORES", "500"))
 MAX_FILLS = int(os.getenv("MAX_FILLS", "500"))
+
+# Daily reconciliation settings
+RECONCILE_INTERVAL_HOURS = int(os.getenv("RECONCILE_INTERVAL_HOURS", "6"))  # Run every 6 hours
+RECONCILE_ON_STARTUP = os.getenv("RECONCILE_ON_STARTUP", "true").lower() == "true"
 
 # R-multiple calculation: assumed stop loss fraction (1% = 0.01)
 ASSUMED_STOP_FRACTION = float(os.getenv("ASSUMED_STOP_FRACTION", "0.01"))
@@ -365,7 +369,7 @@ async def handle_fill_for_positions(fill: FillEvent) -> None:
         print(f"[hl-decide] Error handling fill for positions: {e}")
 
 
-async def handle_fill_via_episodes(fill: FillEvent) -> Optional[Episode]:
+async def handle_fill_via_episodes(fill: Union[FillEvent, EpisodeFill]) -> Optional[Episode]:
     """
     Process a fill through the episode tracker for proper position lifecycle management.
 
@@ -375,25 +379,40 @@ async def handle_fill_via_episodes(fill: FillEvent) -> Optional[Episode]:
     3. Calculates R-multiples when positions close
     4. Updates NIG posteriors from episode outcomes
 
+    Accepts both FillEvent (from real-time NATS) and EpisodeFill (from reconciliation).
+
     Args:
-        fill: The incoming fill event
+        fill: The incoming fill event (FillEvent or EpisodeFill)
 
     Returns:
         Closed Episode if position closed, None otherwise
     """
     try:
-        # Convert FillEvent to EpisodeFill
-        episode_fill = EpisodeFill(
-            fill_id=fill.fill_id,
-            address=fill.address,
-            asset=fill.asset,
-            side=fill.side,
-            size=float(fill.size or 0),
-            price=float(fill.price) if hasattr(fill, 'price') and fill.price else 0.0,
-            ts=fill.ts if isinstance(fill.ts, datetime) else datetime.fromisoformat(str(fill.ts).replace('Z', '+00:00')),
-            realized_pnl=float(fill.realized_pnl) if fill.realized_pnl else None,
-            fees=0.0,  # Could extract from meta if available
-        )
+        # Convert to EpisodeFill if needed
+        if isinstance(fill, EpisodeFill):
+            episode_fill = fill
+        else:
+            episode_fill = EpisodeFill(
+                fill_id=fill.fill_id,
+                address=fill.address,
+                asset=fill.asset,
+                side=fill.side,
+                size=float(fill.size or 0),
+                price=float(fill.price) if hasattr(fill, 'price') and fill.price else 0.0,
+                ts=fill.ts if isinstance(fill.ts, datetime) else datetime.fromisoformat(str(fill.ts).replace('Z', '+00:00')),
+                realized_pnl=float(fill.realized_pnl) if fill.realized_pnl else None,
+                fees=0.0,  # Could extract from meta if available
+            )
+
+        # Track this fill to prevent double processing during reconciliation
+        # This is important for deduplication when real-time and reconciliation overlap
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO episode_fill_ids (fill_id) VALUES ($1) ON CONFLICT DO NOTHING
+                """,
+                episode_fill.fill_id,
+            )
 
         # Process through episode tracker
         closed_episode = episode_tracker.process_fill(episode_fill)
@@ -404,12 +423,12 @@ async def handle_fill_via_episodes(fill: FillEvent) -> Optional[Episode]:
             return closed_episode
 
         # Check if we just opened a new episode
-        open_episode = episode_tracker.get_open_episode(fill.address, fill.asset)
+        open_episode = episode_tracker.get_open_episode(episode_fill.address, episode_fill.asset)
         if open_episode and len(open_episode.entry_fills) == 1:
             # New position opened
             await persist_open_episode(open_episode)
             position_open_counter.inc()
-            print(f"[hl-decide] Episode opened: {fill.address[:10]}... {open_episode.direction} {fill.asset}")
+            print(f"[hl-decide] Episode opened: {episode_fill.address[:10]}... {open_episode.direction} {episode_fill.asset}")
 
         return None
 
@@ -731,6 +750,189 @@ async def restore_state() -> tuple[int, int]:
         print(f"[hl-decide] Failed to restore state: {e}")
 
     return score_count, fill_count
+
+
+async def reconcile_historical_fills(force: bool = False) -> dict:
+    """
+    Reconcile episodes from historical fills in hl_events table.
+    This processes fills that were loaded via backfill or missed during downtime.
+
+    Safe to run multiple times - uses episode_fill_ids table to prevent double-booking.
+
+    Args:
+        force: If True, reprocess all fills even if already processed
+
+    Returns:
+        dict with counts: {"found": N, "new": N, "skipped": N, "errors": N}
+    """
+    result = {"found": 0, "new": 0, "skipped": 0, "errors": 0}
+    try:
+        async with app.state.db.acquire() as conn:
+            # Ensure tracking table exists for processed fill IDs
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episode_fill_ids (
+                    fill_id TEXT PRIMARY KEY,
+                    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+                """
+            )
+
+            # Get historical fills from hl_events (trades from backfill)
+            # Filter to Alpha Pool addresses and BTC/ETH only
+            # Exclude already processed fill IDs unless force=True
+            if force:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        e.address,
+                        e.payload->>'symbol' as asset,
+                        e.payload->>'action' as action,
+                        e.payload->>'size' as size,
+                        e.payload->>'priceUsd' as price,
+                        e.payload->>'fee' as fee,
+                        e.payload->>'at' as ts,
+                        e.payload->>'hash' as hash
+                    FROM hl_events e
+                    INNER JOIN alpha_pool_addresses a ON lower(e.address) = lower(a.address)
+                    WHERE e.type = 'trade'
+                      AND e.payload->>'symbol' IN ('BTC', 'ETH')
+                      AND e.payload->>'at' IS NOT NULL
+                    ORDER BY (e.payload->>'at')::timestamp ASC
+                    LIMIT 10000
+                    """
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        e.address,
+                        e.payload->>'symbol' as asset,
+                        e.payload->>'action' as action,
+                        e.payload->>'size' as size,
+                        e.payload->>'priceUsd' as price,
+                        e.payload->>'fee' as fee,
+                        e.payload->>'at' as ts,
+                        e.payload->>'hash' as hash
+                    FROM hl_events e
+                    INNER JOIN alpha_pool_addresses a ON lower(e.address) = lower(a.address)
+                    LEFT JOIN episode_fill_ids efi ON e.payload->>'hash' = efi.fill_id
+                    WHERE e.type = 'trade'
+                      AND e.payload->>'symbol' IN ('BTC', 'ETH')
+                      AND e.payload->>'at' IS NOT NULL
+                      AND efi.fill_id IS NULL
+                    ORDER BY (e.payload->>'at')::timestamp ASC
+                    LIMIT 10000
+                    """
+                )
+
+            result["found"] = len(rows)
+            print(f"[hl-decide] Reconciliation found {len(rows)} fills to process")
+
+            for row in rows:
+                try:
+                    fill_id = row["hash"]
+                    if not fill_id:
+                        result["skipped"] += 1
+                        continue
+
+                    # Parse action to determine side
+                    action = row["action"] or ""
+                    action_lower = action.lower()
+
+                    # Determine side from action
+                    if "long" in action_lower:
+                        if "close" in action_lower:
+                            side = "sell"  # Closing long = sell
+                        else:
+                            side = "buy"  # Open/Increase long = buy
+                    elif "short" in action_lower:
+                        if "close" in action_lower:
+                            side = "buy"  # Closing short = buy
+                        else:
+                            side = "sell"  # Open/Increase short = sell
+                    else:
+                        result["skipped"] += 1
+                        continue  # Skip if we can't determine side
+
+                    # Parse timestamp
+                    ts_str = row["ts"]
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+                    # Create episode fill
+                    fill = EpisodeFill(
+                        fill_id=fill_id,
+                        address=row["address"].lower(),
+                        asset=row["asset"],
+                        side=side,
+                        size=abs(float(row["size"] or 0)),
+                        price=float(row["price"] or 0),
+                        ts=ts,
+                        fees=float(row["fee"] or 0),
+                    )
+
+                    # Process through episode tracker (this updates NIG on close)
+                    episode = await handle_fill_via_episodes(fill)
+
+                    # Mark fill as processed to prevent double-booking
+                    await conn.execute(
+                        "INSERT INTO episode_fill_ids (fill_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                        fill_id,
+                    )
+
+                    result["new"] += 1
+                except Exception as fill_err:
+                    result["errors"] += 1
+                    continue
+
+        print(f"[hl-decide] Reconciliation complete: {result}")
+
+    except Exception as e:
+        print(f"[hl-decide] Reconciliation failed: {e}")
+        result["errors"] += 1
+
+    return result
+
+
+# Alias for backward compatibility
+async def bootstrap_from_historical_fills() -> int:
+    """Bootstrap episodes from historical fills. Alias for reconcile_historical_fills."""
+    result = await reconcile_historical_fills(force=False)
+    return result.get("new", 0)
+
+
+async def periodic_reconciliation_task():
+    """
+    Background task that periodically reconciles historical fills.
+
+    This catches any fills that were missed due to:
+    - Service downtime
+    - Hyperliquid API rate limits during real-time processing
+    - Network issues
+
+    Runs every RECONCILE_INTERVAL_HOURS (default 6 hours).
+    """
+    interval_seconds = RECONCILE_INTERVAL_HOURS * 3600
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+
+            print(f"[hl-decide] Starting periodic reconciliation (every {RECONCILE_INTERVAL_HOURS}h)...")
+            result = await reconcile_historical_fills(force=False)
+
+            if result["new"] > 0:
+                print(f"[hl-decide] Periodic reconciliation: found {result['new']} new fills to process")
+            else:
+                print(f"[hl-decide] Periodic reconciliation: no new fills found")
+
+        except asyncio.CancelledError:
+            print("[hl-decide] Periodic reconciliation task cancelled")
+            break
+        except Exception as e:
+            print(f"[hl-decide] Periodic reconciliation error: {e}")
+            # Continue running despite errors
+            await asyncio.sleep(60)  # Wait 1 minute before retrying
 
 
 def enforce_limits():
@@ -1082,6 +1284,18 @@ async def startup():
         # Connect to database first
         app.state.db = await asyncpg.create_pool(DB_URL)
 
+        # Ensure episode_fill_ids table exists for deduplication
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episode_fill_ids (
+                    fill_id TEXT PRIMARY KEY,
+                    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+                """
+            )
+        print("[hl-decide] episode_fill_ids table ready for deduplication")
+
         # Initialize ATR provider for dynamic stop distances
         app.state.atr_provider = init_atr_provider(app.state.db)
         print("[hl-decide] ATR provider initialized")
@@ -1111,6 +1325,10 @@ async def startup():
         score_count, fill_count = await restore_state()
         print(f"[hl-decide] Restored {score_count} scores and {fill_count} fills from database")
 
+        # Bootstrap episodes from historical fills (hl_events table)
+        # This processes fills that were loaded via backfill, not real-time NATS
+        bootstrap_count = await bootstrap_from_historical_fills()
+
         # Count open positions
         async with app.state.db.acquire() as conn:
             open_count = await conn.fetchval(
@@ -1128,6 +1346,10 @@ async def startup():
         await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
         await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
 
+        # Start periodic reconciliation background task
+        app.state.reconcile_task = asyncio.create_task(periodic_reconciliation_task())
+        print(f"[hl-decide] Periodic reconciliation scheduled every {RECONCILE_INTERVAL_HOURS} hours")
+
         print("[hl-decide] Started with position-based tracking, ATR stops, and correlation matrix")
     except Exception as e:
         print(f"[hl-decide] Fatal startup error: {e}")
@@ -1136,6 +1358,14 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    # Cancel periodic reconciliation task
+    if hasattr(app.state, "reconcile_task"):
+        app.state.reconcile_task.cancel()
+        try:
+            await app.state.reconcile_task
+        except asyncio.CancelledError:
+            pass
+
     if hasattr(app.state, "nc"):
         await app.state.nc.drain()
     if hasattr(app.state, "db"):
@@ -1164,6 +1394,19 @@ async def health():
 async def metrics():
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/reconcile")
+async def reconcile_fills(force: bool = False):
+    """
+    Manually trigger reconciliation of historical fills.
+    Safe to run multiple times - tracks processed fill IDs to prevent double-booking.
+
+    Args:
+        force: If True, reprocess all fills even if already processed
+    """
+    result = await reconcile_historical_fills(force=force)
+    return result
 
 
 @app.get("/positions/open")
