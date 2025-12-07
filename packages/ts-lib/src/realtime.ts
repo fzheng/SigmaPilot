@@ -124,9 +124,151 @@ export class RealtimeTracker {
     ws.on('close', () => {
       slot.ready = false;
       console.log(`[realtime] WebSocket slot ${slotIdx} closed`);
+      // Reconnect and resubscribe users
+      this.reconnectWsSlot(slotIdx).catch((e) => {
+        console.warn(`[realtime] Failed to reconnect WebSocket slot ${slotIdx}:`, e);
+      });
     });
 
     return slotIdx;
+  }
+
+  /**
+   * Reconnect a WebSocket slot and resubscribe all users.
+   */
+  private async reconnectWsSlot(slotIdx: number): Promise<void> {
+    if (slotIdx < 0 || slotIdx >= this.wsPool.length) return;
+    const slot = this.wsPool[slotIdx];
+
+    // Get list of users to resubscribe
+    const usersToResubscribe = Array.from(slot.users);
+    if (usersToResubscribe.length === 0) {
+      console.log(`[realtime] WebSocket slot ${slotIdx} has no users, skipping reconnect`);
+      return;
+    }
+
+    console.log(`[realtime] Reconnecting WebSocket slot ${slotIdx} with ${usersToResubscribe.length} users`);
+
+    // Clear old slot data
+    slot.users.clear();
+    slot.handlers.clear();
+
+    // Wait before reconnecting to avoid rapid reconnect loops
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Create new WebSocket connection
+    try {
+      const newWs = new this.wsImpl('wss://api.hyperliquid.xyz/ws');
+
+      // Wait for connection
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('WS reconnect timeout')), 10000);
+        newWs.on('open', () => {
+          clearTimeout(timeout);
+          slot.ws = newWs;
+          slot.ready = true;
+          console.log(`[realtime] WebSocket slot ${slotIdx} reconnected`);
+          resolve();
+        });
+        newWs.on('error', (e: any) => {
+          clearTimeout(timeout);
+          reject(e);
+        });
+      });
+
+      // Set up message handler for this slot
+      newWs.on('message', (data: any) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          // Route user events to the appropriate handler
+          if (msg.channel === 'user' && msg.data?.fills) {
+            // Fills don't contain user address directly, so we broadcast to all handlers
+            for (const handler of slot.handlers.values()) {
+              handler(msg.data);
+            }
+          }
+        } catch {}
+      });
+
+      newWs.on('close', () => {
+        slot.ready = false;
+        console.log(`[realtime] WebSocket slot ${slotIdx} closed`);
+        // Reconnect and resubscribe users
+        this.reconnectWsSlot(slotIdx).catch((e) => {
+          console.warn(`[realtime] Failed to reconnect WebSocket slot ${slotIdx}:`, e);
+        });
+      });
+
+      // Resubscribe all users
+      for (const addr of usersToResubscribe) {
+        const user = addr as `0x${string}`;
+        const subResult = await new Promise<'ok' | 'limit' | 'error'>((resolve) => {
+          const timeout = setTimeout(() => resolve('error'), 5000);
+
+          const handler = (data: any) => {
+            try {
+              const msg = JSON.parse(data.toString());
+              if (msg.channel === 'subscriptionResponse' &&
+                  msg.data?.subscription?.type === 'userEvents' &&
+                  msg.data?.subscription?.user?.toLowerCase() === user.toLowerCase()) {
+                clearTimeout(timeout);
+                newWs.removeListener('message', handler);
+                resolve('ok');
+              } else if (msg.channel === 'error' && msg.data?.includes('10 total users')) {
+                clearTimeout(timeout);
+                newWs.removeListener('message', handler);
+                resolve('limit');
+              }
+            } catch {}
+          };
+          newWs.on('message', handler);
+
+          try {
+            newWs.send(JSON.stringify({
+              method: 'subscribe',
+              subscription: { type: 'userEvents', user }
+            }));
+          } catch {
+            clearTimeout(timeout);
+            newWs.removeListener('message', handler);
+            resolve('error');
+          }
+        });
+
+        if (subResult === 'ok') {
+          slot.users.add(addr);
+
+          // Update subs map to point to this slot
+          const sub = this.subs.get(addr);
+          if (sub) {
+            sub.wsSlotIdx = slotIdx;
+          }
+
+          // Register handler for this user's fills
+          slot.handlers.set(addr, (data: any) => {
+            if (data?.fills) {
+              this.onUserEvents(addr, data);
+            }
+          });
+
+          console.log(`[realtime] Resubscribed to ${addr} (${slot.users.size}/${MAX_USERS_PER_WS})`);
+        } else {
+          console.warn(`[realtime] Failed to resubscribe ${addr}: ${subResult}`);
+        }
+      }
+
+      console.log(`[realtime] WebSocket slot ${slotIdx} resubscribed ${slot.users.size}/${usersToResubscribe.length} users`);
+    } catch (e) {
+      console.warn(`[realtime] WebSocket slot ${slotIdx} reconnection failed:`, e);
+      // Try again after delay
+      setTimeout(() => {
+        // Re-add users to slot for next reconnect attempt
+        for (const addr of usersToResubscribe) {
+          slot.users.add(addr);
+        }
+        this.reconnectWsSlot(slotIdx).catch(() => {});
+      }, 10000);
+    }
   }
 
   /**
