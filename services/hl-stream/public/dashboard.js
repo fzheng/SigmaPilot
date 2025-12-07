@@ -98,6 +98,7 @@ const MAX_CUSTOM_PINNED = 3;
 let fillsCache = [];
 let dashboardPeriod = 30;
 let addressMeta = {};
+let legacyAddresses = new Set(); // Addresses in Legacy Leaderboard (for WebSocket fill filtering)
 let customPinnedCount = 0;
 let positionsReady = false; // Track whether positions have been loaded
 
@@ -1390,10 +1391,10 @@ function renderGroupRow(group, isNew = false) {
 function renderAggregatedFills() {
   if (aggregatedGroups.length === 0) {
     fillsTable.innerHTML = `<tr><td colspan="7">
-      <div class="fills-empty-state">
-        <span class="empty-icon">📊</span>
-        <p>No BTC/ETH fills yet</p>
-        <span class="empty-hint">Fills will appear here as they happen</span>
+      <div class="waiting-state">
+        <span class="waiting-icon">📡</span>
+        <span class="waiting-text">Waiting for live fills...</span>
+        <span class="waiting-hint">BTC/ETH trades will appear in real-time as they happen</span>
       </div>
     </td></tr>`;
     updateFillsUI();
@@ -1556,9 +1557,12 @@ async function refreshSummary() {
         : [];
     const holdings = normalizeHoldings(data.holdings || {});
     addressMeta = {};
+    legacyAddresses = new Set(); // Reset legacy addresses
     rows.forEach((row) => {
       if (!row?.address) return;
-      addressMeta[row.address.toLowerCase()] = { remark: row.remark || null };
+      const lowerAddr = row.address.toLowerCase();
+      addressMeta[lowerAddr] = { remark: row.remark || null };
+      legacyAddresses.add(lowerAddr); // Track for WebSocket fill filtering
     });
     renderAddresses(rows, data.profiles || {}, holdings);
 
@@ -1579,7 +1583,8 @@ async function refreshSummary() {
 
 async function refreshFills() {
   try {
-    const data = await fetchJson(`${API_BASE}/fills?limit=40`);
+    // Use legacy-specific endpoint that filters to leaderboard + pinned accounts only
+    const data = await fetchJson(`${API_BASE}/legacy/fills?limit=40`);
     const newFills = data.fills || [];
 
     if (fillsCache.length === 0) {
@@ -1673,9 +1678,18 @@ function connectWs() {
               resulting_position: resultingPos,
               price_usd: e.priceUsd ?? e.payload?.priceUsd ?? null,
               closed_pnl_usd: e.realizedPnlUsd ?? e.payload?.realizedPnlUsd ?? null,
-              symbol
+              symbol,
+              hash: e.hash || e.payload?.hash,
+              at: e.at,
+              side: sizeNum >= 0 ? 'buy' : 'sell'
             };
-            pushFill(row);
+            // Add to legacy fills cache ONLY if address is in legacy leaderboard
+            const addrLower = (e.address || '').toLowerCase();
+            if (legacyAddresses.has(addrLower)) {
+              pushFill(row);
+            }
+            // Also add to Alpha Pool fills cache if address is in pool
+            addAlphaFillFromWs(row);
           });
       }
     } catch (err) {
@@ -2000,7 +2014,8 @@ async function loadMoreFills() {
 
   try {
     const beforeTime = fillsOldestTime || new Date().toISOString();
-    const url = `${API_BASE}/fills/backfill?before=${encodeURIComponent(beforeTime)}&limit=30`;
+    // Use Legacy-specific endpoint for Legacy tab fills
+    const url = `${API_BASE}/legacy/fills/backfill?before=${encodeURIComponent(beforeTime)}&limit=30`;
     const data = await fetchJson(url);
 
     if (data.fills && data.fills.length > 0) {
@@ -2075,7 +2090,8 @@ async function fetchHistoryFromAPI() {
   }
 
   try {
-    const response = await fetch(`${API_BASE}/fills/fetch-history`, {
+    // Use Legacy-specific endpoint for Legacy tab historical fills
+    const response = await fetch(`${API_BASE}/legacy/fills/fetch-history`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ limit: 50 })
@@ -2147,8 +2163,8 @@ async function init() {
   await refreshAlphaPool();
   // Await initial fills load to prevent double-render flash
   await refreshFills();
-  // Render Alpha Pool activity after both datasets are loaded
-  renderAlphaFills();
+  // Load Alpha Pool fills from dedicated endpoint (independent from legacy fills)
+  await refreshAlphaFills();
   renderAIRecommendations();
   refreshBanditStatus();
   connectWs();
@@ -2188,6 +2204,11 @@ function switchTab(tabId) {
   // Load data for the tab if needed
   if (tabId === 'alpha-pool') {
     refreshAlphaPool();
+  } else if (tabId === 'legacy-leaderboard') {
+    // Clear stale data and refresh Legacy fills when switching to this tab
+    fillsCache = [];
+    aggregatedGroups = [];
+    refreshFills();
   }
 
   // Store preference
@@ -2209,26 +2230,34 @@ tabButtons.forEach(btn => {
 const alphaPoolTable = document.getElementById('alpha-pool-table');
 const alphaPoolStats = document.getElementById('alpha-pool-stats');
 const alphaPoolConfig = document.getElementById('alpha-pool-config');
-const alphaPoolRefreshBtn = document.getElementById('alpha-pool-refresh-btn');
 const alphaFillsTable = document.getElementById('alpha-fills-table');
 const alphaFillsCount = document.getElementById('alpha-fills-count');
 const alphaPoolBadge = document.getElementById('alpha-pool-badge');
+const alphaPoolRefreshStatus = document.getElementById('alpha-pool-refresh-status');
 
 let alphaPoolData = [];
 let alphaPoolAddresses = new Set();
+let alphaFillsCache = []; // Separate cache for Alpha Pool fills
+let alphaFillsLoading = false;
+let refreshStatusPolling = null;
+let lastRefreshCompleted = null;
+let isRefreshRunning = false; // Track if a refresh is in progress (for empty state message)
+let currentRefreshStatus = null; // Store full status for loading UI
 
 /**
  * Fetch and render Alpha Pool data
  */
 async function refreshAlphaPool() {
   // Show loading state if table is empty
-  if (alphaPoolTable && alphaPoolData.length === 0) {
+  // But if refresh is running, let renderAlphaPoolTable() show the proper refresh progress
+  if (alphaPoolTable && alphaPoolData.length === 0 && !isRefreshRunning) {
     alphaPoolTable.innerHTML = `
       <tr>
         <td colspan="7">
           <div class="alpha-pool-loading">
             <span class="loading-spinner"></span>
-            <span>Loading Alpha Pool traders...</span>
+            <span class="loading-text">Loading Alpha Pool traders...</span>
+            <span class="loading-hint">Fetching data from server</span>
           </div>
         </td>
       </tr>
@@ -2251,7 +2280,11 @@ async function refreshAlphaPool() {
 
     // Update stats
     if (alphaPoolStats) {
-      alphaPoolStats.textContent = `${data.count} traders | ${selectedCount} selected`;
+      if (alphaPoolData.length > 0) {
+        alphaPoolStats.textContent = `${data.count} traders | ${selectedCount} selected`;
+      } else {
+        alphaPoolStats.textContent = 'No data';
+      }
     }
 
     // Update config display with refresh timing
@@ -2298,12 +2331,27 @@ async function refreshAlphaPool() {
       `;
     }
 
-    // Render table
+    // Render table (handles empty state internally)
     renderAlphaPoolTable();
   } catch (err) {
     console.error('Alpha pool fetch error:', err);
     if (alphaPoolStats) {
-      alphaPoolStats.textContent = 'Error loading';
+      alphaPoolStats.textContent = 'Error';
+    }
+    // Show error state in table
+    if (alphaPoolTable) {
+      alphaPoolTable.innerHTML = `
+        <tr>
+          <td colspan="7">
+            <div class="error-state">
+              <span class="error-icon">⚠️</span>
+              <span class="error-title">Failed to load Alpha Pool</span>
+              <span class="error-message">Could not connect to server. Please check your connection and try again.</span>
+              <button class="error-action" onclick="refreshAlphaPool()">Retry</button>
+            </div>
+          </td>
+        </tr>
+      `;
     }
   }
 }
@@ -2313,6 +2361,41 @@ async function refreshAlphaPool() {
  */
 function renderAlphaPoolTable() {
   if (!alphaPoolTable) return;
+
+  // Handle empty state - no traders in pool
+  if (alphaPoolData.length === 0) {
+    // Show different message if refresh is running
+    if (isRefreshRunning) {
+      const stepText = currentRefreshStatus ? formatRefreshStep(currentRefreshStatus.current_step) : 'Starting...';
+      const progressText = currentRefreshStatus && currentRefreshStatus.progress > 0 ? `${currentRefreshStatus.progress}%` : '';
+      alphaPoolTable.innerHTML = `
+        <tr>
+          <td colspan="7">
+            <div class="alpha-pool-loading">
+              <span class="loading-spinner"></span>
+              <span class="loading-text" id="loading-step-text">${stepText}</span>
+              <span class="loading-progress" id="loading-progress-text">${progressText}</span>
+              <span class="loading-hint">Fetching and filtering top traders from Hyperliquid. This may take a few minutes.</span>
+            </div>
+          </td>
+        </tr>
+      `;
+    } else {
+      alphaPoolTable.innerHTML = `
+        <tr>
+          <td colspan="7">
+            <div class="empty-state">
+              <span class="empty-icon">🎯</span>
+              <span class="empty-title">No Alpha Pool Data</span>
+              <span class="empty-message">The Alpha Pool hasn't been populated yet. Click the button below to fetch top traders from Hyperliquid.</span>
+              <button class="empty-action" onclick="triggerAlphaPoolRefresh()" id="refresh-alpha-pool-btn">Refresh Alpha Pool</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+    return;
+  }
 
   alphaPoolTable.innerHTML = alphaPoolData.map(trader => {
     const muClass = trader.nig_m > 0 ? 'mu-positive' : trader.nig_m < 0 ? 'mu-negative' : '';
@@ -2341,16 +2424,159 @@ function renderAlphaPoolTable() {
 }
 
 /**
+ * Trigger Alpha Pool refresh from Hyperliquid API
+ */
+async function triggerAlphaPoolRefresh() {
+  const btn = document.getElementById('refresh-alpha-pool-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Refreshing...';
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/alpha-pool/refresh?limit=50&background=true`, { method: 'POST' });
+
+    // Handle 409 Conflict - refresh already in progress
+    if (res.status === 409) {
+      // Set running state and show loading UI
+      isRefreshRunning = true;
+      renderAlphaPoolTable();
+      startRefreshStatusPolling();
+      return;
+    }
+
+    if (!res.ok) throw new Error('Refresh failed');
+
+    // Start polling for refresh status
+    isRefreshRunning = true;
+    renderAlphaPoolTable();
+    startRefreshStatusPolling();
+  } catch (err) {
+    console.error('Alpha pool refresh error:', err);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Refresh Alpha Pool';
+    }
+    alert('Failed to start refresh. Please try again.');
+  }
+}
+
+/**
+ * Fetch Alpha Pool fills from the dedicated endpoint
+ */
+async function refreshAlphaFills() {
+  if (alphaFillsLoading) return;
+  alphaFillsLoading = true;
+
+  // Show loading state if cache is empty
+  if (alphaFillsTable && alphaFillsCache.length === 0) {
+    alphaFillsTable.innerHTML = `
+      <tr>
+        <td colspan="6">
+          <div class="alpha-pool-loading">
+            <span class="loading-spinner"></span>
+            <span class="loading-text">Loading Alpha Pool activity...</span>
+            <span class="loading-hint">Fetching recent trades</span>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/alpha-pool/fills?limit=50`);
+    if (!res.ok) throw new Error('Failed to fetch alpha pool fills');
+    const data = await res.json();
+
+    // Merge with existing cache, avoiding duplicates
+    const existingIds = new Set(alphaFillsCache.map(f => f.hash || f.fill_id || `${f.address}-${f.time_utc}`));
+    const newFills = (data.fills || []).filter(f => {
+      const id = f.hash || f.fill_id || `${f.address}-${f.time_utc}`;
+      return !existingIds.has(id);
+    });
+
+    if (newFills.length > 0) {
+      alphaFillsCache = [...alphaFillsCache, ...newFills];
+      // Sort by time descending
+      alphaFillsCache.sort((a, b) => {
+        const timeA = new Date(a.time_utc || a.at || 0).getTime();
+        const timeB = new Date(b.time_utc || b.at || 0).getTime();
+        return timeB - timeA;
+      });
+      // Keep only most recent 200
+      alphaFillsCache = alphaFillsCache.slice(0, 200);
+    }
+
+    renderAlphaFills();
+  } catch (err) {
+    console.error('Failed to fetch alpha pool fills:', err);
+    if (alphaFillsCache.length === 0 && alphaFillsTable) {
+      alphaFillsTable.innerHTML = `
+        <tr>
+          <td colspan="6">
+            <div class="error-state">
+              <span class="error-icon">⚠️</span>
+              <span class="error-title">Failed to load activity</span>
+              <span class="error-message">Could not fetch trades. Please try again.</span>
+              <button class="error-action" onclick="refreshAlphaFills()">Retry</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+  } finally {
+    alphaFillsLoading = false;
+  }
+}
+
+/**
+ * Add a WebSocket fill to Alpha Pool cache if it's from a pool address
+ */
+function addAlphaFillFromWs(fill) {
+  if (!alphaPoolAddresses.has(fill.address?.toLowerCase())) return;
+
+  // Check for duplicates
+  const id = fill.hash || fill.fill_id || `${fill.address}-${fill.at}`;
+  const exists = alphaFillsCache.some(f => {
+    const existingId = f.hash || f.fill_id || `${f.address}-${f.time_utc || f.at}`;
+    return existingId === id;
+  });
+
+  if (!exists) {
+    alphaFillsCache.unshift(fill);
+    // Keep only most recent 200
+    if (alphaFillsCache.length > 200) {
+      alphaFillsCache = alphaFillsCache.slice(0, 200);
+    }
+    renderAlphaFills();
+  }
+}
+
+/**
  * Render Alpha Pool activity (fills from pool traders only)
  */
 function renderAlphaFills() {
   if (!alphaFillsTable) return;
 
-  // Filter fills to only show Alpha Pool traders
-  const alphaFills = fillsCache.filter(f => alphaPoolAddresses.has(f.address?.toLowerCase()));
+  // Use the dedicated Alpha Pool fills cache
+  const alphaFills = alphaFillsCache;
 
   if (alphaFillsCount) {
     alphaFillsCount.textContent = `${alphaFills.length} fills`;
+  }
+
+  if (alphaFills.length === 0) {
+    if (!alphaFillsLoading) {
+      alphaFillsTable.innerHTML = `
+        <tr><td colspan="6">
+          <div class="waiting-state">
+            <span class="waiting-icon">📡</span>
+            <span class="waiting-text">Waiting for Alpha Pool activity...</span>
+            <span class="waiting-hint">Trades from selected traders will appear in real-time</span>
+          </div>
+        </td></tr>`;
+    }
+    return;
   }
 
   alphaFillsTable.innerHTML = alphaFills.slice(0, 50).map(fill => {
@@ -2385,27 +2611,189 @@ function renderAlphaFills() {
       </tr>
     `;
   }).join('');
+}
 
-  if (alphaFills.length === 0) {
-    alphaFillsTable.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No activity from Alpha Pool traders yet</td></tr>';
+/**
+ * Update loading progress in the table (without re-rendering entire table)
+ */
+function updateLoadingProgress(status) {
+  const stepEl = document.getElementById('loading-step-text');
+  const progressEl = document.getElementById('loading-progress-text');
+
+  if (stepEl) {
+    stepEl.textContent = formatRefreshStep(status.current_step);
+  }
+  if (progressEl) {
+    progressEl.textContent = status.progress > 0 ? `${status.progress}%` : '';
   }
 }
 
-// Alpha Pool refresh button
-if (alphaPoolRefreshBtn) {
-  alphaPoolRefreshBtn.addEventListener('click', () => {
-    alphaPoolRefreshBtn.disabled = true;
-    alphaPoolRefreshBtn.textContent = '...';
-    refreshAlphaPool().finally(() => {
-      alphaPoolRefreshBtn.disabled = false;
-      alphaPoolRefreshBtn.textContent = '↻';
-    });
-  });
+function formatRefreshStep(step) {
+  const stepNames = {
+    'idle': 'Idle',
+    'starting': 'Starting...',
+    'fetching_leaderboard': 'Fetching leaderboard...',
+    'filtering_candidates': 'Filtering candidates...',
+    'analyzing_traders': 'Analyzing traders...',
+    'saving_traders': 'Saving traders...',
+    'backfilling_fills': 'Backfilling fills...',
+    'reconciling': 'Reconciling...',
+    'completed': 'Completed',
+    'failed': 'Failed',
+  };
+  return stepNames[step] || step;
 }
+
+/**
+ * Update the refresh status indicator in the UI
+ */
+function updateRefreshStatusUI(status) {
+  // ALWAYS track running state globally, even if DOM element is missing
+  // This is critical for showing correct empty state (loading vs button)
+  const wasRunning = isRefreshRunning;
+  isRefreshRunning = status.is_running;
+  currentRefreshStatus = status;
+
+  // Re-render table when refresh state changes AND pool is empty
+  // This must happen regardless of header status element
+  if (alphaPoolData.length === 0 && wasRunning !== isRefreshRunning) {
+    renderAlphaPoolTable();
+  }
+
+  // Update loading UI with progress (if visible in table)
+  if (alphaPoolData.length === 0 && isRefreshRunning) {
+    updateLoadingProgress(status);
+  }
+
+  // Header status indicator is optional - return if not present
+  if (!alphaPoolRefreshStatus) return;
+
+  if (status.is_running) {
+    alphaPoolRefreshStatus.style.display = 'inline-flex';
+    alphaPoolRefreshStatus.className = 'alpha-pool-refresh-status';
+
+    const textEl = alphaPoolRefreshStatus.querySelector('.refresh-text');
+    const progressEl = alphaPoolRefreshStatus.querySelector('.refresh-progress');
+
+    if (textEl) textEl.textContent = formatRefreshStep(status.current_step);
+    if (progressEl) {
+      if (status.progress > 0) {
+        progressEl.textContent = `${status.progress}%`;
+      } else {
+        progressEl.textContent = '';
+      }
+    }
+  } else if (status.current_step === 'completed') {
+    // Show completed status briefly, then hide
+    alphaPoolRefreshStatus.style.display = 'inline-flex';
+    alphaPoolRefreshStatus.className = 'alpha-pool-refresh-status completed';
+
+    const textEl = alphaPoolRefreshStatus.querySelector('.refresh-text');
+    const progressEl = alphaPoolRefreshStatus.querySelector('.refresh-progress');
+
+    if (textEl) textEl.textContent = '✓ Refreshed';
+    if (progressEl && status.elapsed_seconds) {
+      progressEl.textContent = `(${Math.round(status.elapsed_seconds)}s)`;
+    }
+
+    // Hide after 5 seconds and refresh data
+    setTimeout(() => {
+      alphaPoolRefreshStatus.style.display = 'none';
+    }, 5000);
+
+    // Refresh the Alpha Pool data to show updated traders
+    if (lastRefreshCompleted !== status.completed_at) {
+      lastRefreshCompleted = status.completed_at;
+      refreshAlphaPool();
+    }
+  } else if (status.current_step === 'failed') {
+    alphaPoolRefreshStatus.style.display = 'inline-flex';
+    alphaPoolRefreshStatus.className = 'alpha-pool-refresh-status failed';
+
+    const textEl = alphaPoolRefreshStatus.querySelector('.refresh-text');
+    const progressEl = alphaPoolRefreshStatus.querySelector('.refresh-progress');
+
+    if (textEl) textEl.textContent = '✗ Failed';
+    if (progressEl) progressEl.textContent = '';
+
+    // Hide after 10 seconds
+    setTimeout(() => {
+      alphaPoolRefreshStatus.style.display = 'none';
+    }, 10000);
+  } else {
+    // Idle state - hide
+    alphaPoolRefreshStatus.style.display = 'none';
+  }
+}
+
+/**
+ * Poll refresh status from the API
+ */
+async function pollRefreshStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/alpha-pool/refresh/status`);
+    if (!res.ok) return;
+
+    const status = await res.json();
+    updateRefreshStatusUI(status);
+
+    // If running, poll more frequently; otherwise slow down
+    if (status.is_running) {
+      // Poll every 2 seconds while refresh is running
+      if (!refreshStatusPolling || refreshStatusPolling._interval !== 2000) {
+        stopRefreshStatusPolling();
+        refreshStatusPolling = setInterval(pollRefreshStatus, 2000);
+        refreshStatusPolling._interval = 2000;
+      }
+    } else {
+      // Poll every 30 seconds when idle (to catch external refreshes)
+      if (!refreshStatusPolling || refreshStatusPolling._interval !== 30000) {
+        stopRefreshStatusPolling();
+        refreshStatusPolling = setInterval(pollRefreshStatus, 30000);
+        refreshStatusPolling._interval = 30000;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to poll refresh status:', err);
+  }
+}
+
+/**
+ * Start polling for refresh status
+ */
+function startRefreshStatusPolling() {
+  // Stop any existing polling first
+  stopRefreshStatusPolling();
+  // Start polling immediately
+  pollRefreshStatus();
+  // Then continue polling at normal interval
+  refreshStatusPolling = setInterval(pollRefreshStatus, 2000);
+  refreshStatusPolling._interval = 2000;
+}
+
+/**
+ * Stop polling for refresh status
+ */
+function stopRefreshStatusPolling() {
+  if (refreshStatusPolling) {
+    clearInterval(refreshStatusPolling);
+    refreshStatusPolling = null;
+  }
+}
+
+// Expose functions to window for onclick handlers in dynamically generated HTML
+window.triggerAlphaPoolRefresh = triggerAlphaPoolRefresh;
+window.refreshAlphaPool = refreshAlphaPool;
+window.refreshAlphaFills = refreshAlphaFills;
 
 // Initialize Alpha Pool on page load (if tab is active)
 if (document.querySelector('.tab-btn.active[data-tab="alpha-pool"]')) {
-  setTimeout(refreshAlphaPool, 500);
+  // Check refresh status first so we can show proper loading state
+  pollRefreshStatus().then(() => {
+    setTimeout(refreshAlphaPool, 100);
+  });
+  // Start polling for refresh status updates
+  setTimeout(startRefreshStatusPolling, 2000);
 }
 
 // Refresh Alpha Pool periodically when tab is active
@@ -2415,6 +2803,15 @@ setInterval(() => {
     refreshAlphaPool();
   }
 }, 60000); // Every minute
+
+// Poll refresh status when Alpha Pool tab becomes active
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn.getAttribute('data-tab') === 'alpha-pool') {
+      pollRefreshStatus();
+    }
+  });
+});
 
 // =====================
 // Tab Restoration (must be after Alpha Pool is defined)

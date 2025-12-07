@@ -33,6 +33,7 @@ To populate the Alpha Pool:
 """
 
 import os
+import json
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
@@ -390,6 +391,9 @@ async def auto_refresh_alpha_pool_if_empty():
     or a scheduled job.
 
     Runs as a background task to not block service startup.
+
+    IMPORTANT: Uses _background_refresh_task() to properly set is_running=true
+    so the dashboard can detect the refresh is in progress.
     """
     try:
         # Wait a bit for database to be fully ready
@@ -403,36 +407,13 @@ async def auto_refresh_alpha_pool_if_empty():
 
         if total_count == 0:
             print(f"[hl-sage] Alpha Pool has never been refreshed, auto-refreshing (first-time setup)...")
-            traders = await fetch_leaderboard_from_api(limit=ALPHA_POOL_DEFAULT_SIZE)
-            if traders:
-                async with app.state.db.acquire() as conn:
-                    for trader in traders:
-                        await conn.execute(
-                            """
-                            INSERT INTO alpha_pool_addresses (address, nickname, account_value, pnl_30d, roi_30d, win_rate, last_refreshed, is_active)
-                            VALUES ($1, $2, $3, $4, $5, $6, NOW(), true)
-                            ON CONFLICT (address) DO UPDATE SET
-                                nickname = COALESCE(EXCLUDED.nickname, alpha_pool_addresses.nickname),
-                                account_value = EXCLUDED.account_value,
-                                pnl_30d = EXCLUDED.pnl_30d,
-                                roi_30d = EXCLUDED.roi_30d,
-                                win_rate = EXCLUDED.win_rate,
-                                last_refreshed = NOW(),
-                                is_active = true
-                            """,
-                            trader["address"],
-                            trader.get("display_name"),
-                            trader["account_value"],
-                            trader["pnl"],
-                            trader.get("roi", 0.0),
-                            trader["win_rate"],
-                        )
-                print(f"[hl-sage] Alpha Pool auto-refreshed with {len(traders)} traders")
-            else:
-                print(f"[hl-sage] Alpha Pool auto-refresh failed - no traders fetched")
+            # Use _background_refresh_task to properly set is_running=true
+            # This allows the dashboard to detect the refresh is in progress
+            await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
         else:
             print(f"[hl-sage] Alpha Pool has {total_count} records (previously refreshed), skipping auto-refresh")
     except Exception as e:
+        await _refresh_state.fail(str(e))
         print(f"[hl-sage] Alpha Pool auto-refresh failed: {e}")
 
 
@@ -612,14 +593,349 @@ async def bandit_apply_decay(
 # =====================
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
-PNL_CURVE_CONCURRENCY = 2  # Max concurrent requests (reduced to avoid rate limits)
+PNL_CURVE_CONCURRENCY = int(os.getenv("PNL_CURVE_CONCURRENCY", "2"))  # Max concurrent requests
 PNL_CURVE_TIMEOUT = 10.0  # Timeout per request in seconds
-PNL_CURVE_DELAY = 0.3  # Delay between requests in seconds
+PNL_CURVE_DELAY = float(os.getenv("PNL_CURVE_DELAY", "0.3"))  # Delay between requests in seconds
 PNL_CURVE_MAX_RETRIES = 2  # Max retries on rate limit
 PNL_CURVE_CACHE_TTL = int(os.getenv("PNL_CURVE_CACHE_TTL", "86400"))  # Cache TTL in seconds (default 24 hours)
 
+# Historical fill backfill settings
+FILL_BACKFILL_CONCURRENCY = int(os.getenv("FILL_BACKFILL_CONCURRENCY", "1"))  # Max concurrent fill fetch requests
+FILL_BACKFILL_DELAY = float(os.getenv("FILL_BACKFILL_DELAY", "1.0"))  # Delay between requests in seconds
+
+# Rate limiting settings for Hyperliquid API
+# Target: stay under 1200 weight/minute = 20 weight/second
+# userFills = weight 20, so max ~1 req/second for fills
+HL_API_RATE_LIMIT_DELAY = float(os.getenv("HL_API_RATE_LIMIT_DELAY", "1.0"))  # Min delay between API calls
+HL_API_MAX_RETRIES = int(os.getenv("HL_API_MAX_RETRIES", "3"))  # Max retries on 429
+
 # In-memory cache for PnL curves: {address: (timestamp, curve_data)}
 _pnl_curve_cache: Dict[str, tuple] = {}
+
+# In-memory cache for user fills during refresh: {address: fills_list}
+# This cache is cleared after each refresh cycle to avoid stale data
+_fills_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+# Background refresh state
+class RefreshState:
+    """Tracks the state of background Alpha Pool refresh."""
+    def __init__(self):
+        self.is_running = False
+        self.started_at: Optional[datetime] = None
+        self.completed_at: Optional[datetime] = None
+        self.current_step: str = "idle"
+        self.progress: int = 0  # 0-100
+        self.total_traders: int = 0
+        self.processed_traders: int = 0
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[str] = None
+        self._lock = asyncio.Lock()
+
+    async def start(self):
+        async with self._lock:
+            self.is_running = True
+            self.started_at = datetime.now(timezone.utc)
+            self.completed_at = None
+            self.current_step = "starting"
+            self.progress = 0
+            self.total_traders = 0
+            self.processed_traders = 0
+            self.result = None
+            self.error = None
+
+    async def update(self, step: str, progress: int, processed: int = 0, total: int = 0):
+        async with self._lock:
+            self.current_step = step
+            self.progress = progress
+            self.processed_traders = processed
+            self.total_traders = total
+
+    async def complete(self, result: Dict[str, Any]):
+        async with self._lock:
+            self.is_running = False
+            self.completed_at = datetime.now(timezone.utc)
+            self.current_step = "completed"
+            self.progress = 100
+            self.result = result
+            self.error = None
+
+    async def fail(self, error: str):
+        async with self._lock:
+            self.is_running = False
+            self.completed_at = datetime.now(timezone.utc)
+            self.current_step = "failed"
+            self.error = error
+
+    async def get_status(self) -> Dict[str, Any]:
+        async with self._lock:
+            elapsed = None
+            if self.started_at:
+                end = self.completed_at or datetime.now(timezone.utc)
+                elapsed = (end - self.started_at).total_seconds()
+            return {
+                "is_running": self.is_running,
+                "started_at": self.started_at.isoformat() if self.started_at else None,
+                "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+                "elapsed_seconds": elapsed,
+                "current_step": self.current_step,
+                "progress": self.progress,
+                "processed_traders": self.processed_traders,
+                "total_traders": self.total_traders,
+                "result": self.result,
+                "error": self.error,
+            }
+
+_refresh_state = RefreshState()
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for Hyperliquid API calls.
+
+    Hyperliquid limits: 1200 weight/minute per IP
+    - userFills: weight 20 (paginated, +1 per 20 items)
+    - portfolio: weight 20
+    - subAccounts: weight 20 (assumed)
+    - clearinghouseState: weight 2
+
+    Safe target: ~50 weight/second = 3000 weight/minute (2.5x safety margin)
+    For weight-20 calls: ~2.5 calls/second max
+    """
+
+    def __init__(self, calls_per_second: float = 2.0):
+        self._min_interval = 1.0 / calls_per_second
+        self._last_call = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Wait until a request can be made within rate limits."""
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_call
+            if elapsed < self._min_interval:
+                wait_time = self._min_interval - elapsed
+                await asyncio.sleep(wait_time)
+            self._last_call = asyncio.get_event_loop().time()
+
+
+# Global rate limiter for Hyperliquid API
+# Hyperliquid: 1200 weight/minute, userFills = weight 20
+# Safe limit: 1200/20 = 60 calls/minute = 1 call/second
+# Default to 0.8 calls/second (48/min) for safety margin
+_hl_rate_limiter = RateLimiter(calls_per_second=float(os.getenv("HL_API_CALLS_PER_SECOND", "0.8")))
+
+
+async def fetch_user_fills_from_api(
+    client: httpx.AsyncClient,
+    address: str,
+    max_retries: int = HL_API_MAX_RETRIES,
+    use_cache: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch user fills from Hyperliquid API with rate limiting.
+
+    Returns all BTC/ETH fills for the address.
+    Uses rate limiter to stay under Hyperliquid's 1200 weight/minute limit.
+
+    Args:
+        client: Async HTTP client
+        address: Ethereum address
+        max_retries: Max retries on rate limit (uses Retry-After when available)
+        use_cache: Whether to check/update the fills cache
+    """
+    addr_lower = address.lower()
+
+    # Check cache first if enabled
+    if use_cache and addr_lower in _fills_cache:
+        return _fills_cache[addr_lower]
+
+    for attempt in range(max_retries + 1):
+        try:
+            # Rate limit before making the call
+            await _hl_rate_limiter.acquire()
+
+            response = await client.post(
+                HYPERLIQUID_INFO_URL,
+                json={"type": "userFills", "user": addr_lower},
+                timeout=15.0,
+            )
+
+            if response.status_code == 429:
+                if attempt < max_retries:
+                    # Check for Retry-After header
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = (attempt + 1) * 2.0
+                    else:
+                        delay = (attempt + 1) * 2.0
+                    print(f"[hl-sage] Rate limited on fills for {addr_lower[:10]}..., retry {attempt + 1} in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    continue
+                return []
+
+            if response.status_code != 200:
+                return []
+
+            fills = response.json()
+            if not isinstance(fills, list):
+                return []
+
+            # Filter to BTC/ETH only
+            result = []
+            for f in fills:
+                coin = f.get("coin", "").upper()
+                if coin not in ("BTC", "ETH"):
+                    continue
+                result.append({
+                    "coin": coin,
+                    "px": float(f.get("px", 0)),
+                    "sz": float(f.get("sz", 0)),
+                    "side": f.get("side", "B"),  # B=buy, A=ask(sell)
+                    "time": int(f.get("time", 0)),
+                    "startPosition": float(f.get("startPosition", 0)),
+                    "closedPnl": float(f.get("closedPnl", 0)) if f.get("closedPnl") else None,
+                    "fee": float(f.get("fee", 0)) if f.get("fee") else None,
+                    "hash": f.get("hash"),
+                })
+
+            # Cache the result for reuse during same refresh cycle
+            if use_cache:
+                _fills_cache[addr_lower] = result
+
+            return result
+        except Exception as e:
+            if attempt < max_retries:
+                await asyncio.sleep(1.0)
+                continue
+            print(f"[hl-sage] Error fetching fills for {address}: {e}")
+            return []
+    return []
+
+
+async def backfill_historical_fills_for_addresses(
+    pool: asyncpg.Pool,
+    addresses: List[str],
+) -> Dict[str, int]:
+    """
+    Fetch and store historical BTC/ETH fills for the given addresses.
+
+    This is called when new addresses are added to the Alpha Pool to ensure
+    we have historical data for episode construction.
+
+    IMPORTANT: This function reuses fills from the _fills_cache populated by
+    analyze_user_fills() during the HFT filtering step. This avoids duplicate
+    API calls and saves rate limit budget.
+
+    Args:
+        pool: Database connection pool
+        addresses: List of addresses to backfill
+
+    Returns:
+        Dict mapping address -> number of fills inserted
+    """
+    if not addresses:
+        return {}
+
+    results: Dict[str, int] = {}
+    semaphore = asyncio.Semaphore(FILL_BACKFILL_CONCURRENCY)
+
+    async def backfill_one(client: httpx.AsyncClient, addr: str, index: int):
+        addr_lower = addr.lower()
+
+        # Check cache first - fills were already fetched during HFT filtering
+        if addr_lower in _fills_cache:
+            fills = _fills_cache[addr_lower]
+        else:
+            # Stagger requests to avoid rate limiting (only if not cached)
+            if index > 0:
+                await asyncio.sleep(FILL_BACKFILL_DELAY * index)
+            async with semaphore:
+                fills = await fetch_user_fills_from_api(client, addr, use_cache=True)
+
+        if not fills:
+            results[addr] = 0
+            print(f"[hl-sage] Backfill: no fills for {addr[:10]}... (cache={'hit' if addr_lower in _fills_cache else 'miss'})")
+            return
+
+        print(f"[hl-sage] Backfill: processing {len(fills)} fills for {addr[:10]}...")
+        inserted = 0
+        async with pool.acquire() as conn:
+            for f in fills:
+                # Calculate action from position change
+                delta = f["sz"] if f["side"] == "B" else -f["sz"]
+                start_pos = f["startPosition"]
+                new_pos = start_pos + delta
+
+                if start_pos == 0:
+                    action = "Open Long (Open New)" if delta > 0 else "Open Short (Open New)"
+                elif start_pos > 0:
+                    if delta > 0:
+                        action = "Increase Long"
+                    elif new_pos == 0:
+                        action = "Close Long (Close All)"
+                    else:
+                        action = "Decrease Long"
+                else:  # start_pos < 0
+                    if delta < 0:
+                        action = "Increase Short"
+                    elif new_pos == 0:
+                        action = "Close Short (Close All)"
+                    else:
+                        action = "Decrease Short"
+
+                # Build payload matching hl_events format
+                payload = {
+                    "at": datetime.fromtimestamp(f["time"] / 1000, tz=timezone.utc).isoformat(),
+                    "address": addr_lower,
+                    "symbol": f["coin"],
+                    "action": action,
+                    "size": abs(f["sz"]),
+                    "startPosition": start_pos,
+                    "priceUsd": f["px"],
+                    "realizedPnlUsd": f["closedPnl"],
+                    "fee": f["fee"],
+                    "hash": f["hash"],
+                }
+
+                # Insert into hl_events with dedup on hash
+                try:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO hl_events (address, type, symbol, payload)
+                        SELECT $1, 'trade', $2, $3::jsonb
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM hl_events
+                            WHERE type = 'trade' AND payload->>'hash' = $4
+                        )
+                        """,
+                        addr_lower,
+                        f["coin"],
+                        json.dumps(payload),
+                        f["hash"],
+                    )
+                    # asyncpg returns "INSERT 0 1" for successful insert, "INSERT 0 0" if no rows inserted
+                    if result and result.endswith("1"):
+                        inserted += 1
+                except asyncpg.exceptions.UniqueViolationError:
+                    # Duplicate hash - expected, skip
+                    pass
+                except Exception as e:
+                    # Log unexpected errors once per address
+                    if inserted == 0:
+                        print(f"[hl-sage] Backfill error for {addr[:10]}...: {type(e).__name__}: {e}")
+
+        results[addr] = inserted
+        if inserted > 0:
+            print(f"[hl-sage] Backfilled {inserted} fills for {addr[:10]}...")
+
+    async with httpx.AsyncClient() as client:
+        tasks = [backfill_one(client, addr, i) for i, addr in enumerate(addresses)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    return results
 
 
 async def fetch_pnl_curve_from_api(
@@ -641,15 +957,25 @@ async def fetch_pnl_curve_from_api(
         List of {ts, value} points
     """
     try:
+        # Rate limit before making the call
+        await _hl_rate_limiter.acquire()
+
         response = await client.post(
             HYPERLIQUID_INFO_URL,
             json={"type": "portfolio", "user": address.lower()},
             timeout=PNL_CURVE_TIMEOUT,
         )
 
-        # Handle rate limiting with retry
+        # Handle rate limiting with retry and Retry-After header
         if response.status_code == 429 and retries < PNL_CURVE_MAX_RETRIES:
-            delay = (retries + 1) * 2.0  # Exponential backoff: 2s, 4s
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = (retries + 1) * 2.0
+            else:
+                delay = (retries + 1) * 2.0
             await asyncio.sleep(delay)
             return await fetch_pnl_curve_from_api(client, address, window, retries + 1)
 
@@ -980,30 +1306,44 @@ ALPHA_POOL_REFRESH_HOURS = int(os.getenv("ALPHA_POOL_REFRESH_HOURS", "24"))  # R
 async def analyze_user_fills(
     client: httpx.AsyncClient,
     address: str,
-    max_retries: int = 2,
+    max_retries: int = HL_API_MAX_RETRIES,
 ) -> Dict[str, Any]:
     """
     Analyze user's fill history for HFT detection and BTC/ETH trading.
 
-    This combines multiple checks into one API call to avoid rate limits:
+    This uses the shared rate limiter and caches fills for later use by backfill.
+
+    Metrics computed:
     - orders_per_day: HFT detection (> 100 orders/day = HFT)
     - has_btc_eth: Whether trader has BTC or ETH fills
 
     Returns dict with analysis results, or None on error after retries.
     """
+    addr_lower = address.lower()
+
     for attempt in range(max_retries + 1):
         try:
+            # Rate limit before making the call
+            await _hl_rate_limiter.acquire()
+
             response = await client.post(
                 HYPERLIQUID_INFO_URL,
-                json={"type": "userFills", "user": address.lower()},
-                timeout=15.0,  # Increased timeout
+                json={"type": "userFills", "user": addr_lower},
+                timeout=15.0,
             )
 
-            # Handle rate limiting with retry
+            # Handle rate limiting with retry and Retry-After header
             if response.status_code == 429:
                 if attempt < max_retries:
-                    delay = (attempt + 1) * 2.0
-                    print(f"[hl-sage] Rate limited on fills for {address}, retry {attempt + 1} in {delay}s")
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = (attempt + 1) * 2.0
+                    else:
+                        delay = (attempt + 1) * 2.0
+                    print(f"[hl-sage] Rate limited on fills for {addr_lower[:10]}..., retry {attempt + 1} in {delay:.1f}s")
                     await asyncio.sleep(delay)
                     continue
                 return None
@@ -1018,23 +1358,35 @@ async def analyze_user_fills(
             if not isinstance(fills, list):
                 return None
 
+            # Cache the raw fills for later use by backfill
+            # Filter to BTC/ETH and convert to cached format
+            btc_eth_fills = []
+            for f in fills:
+                coin = f.get("coin", "").upper()
+                if coin in ("BTC", "ETH"):
+                    btc_eth_fills.append({
+                        "coin": coin,
+                        "px": float(f.get("px", 0)),
+                        "sz": float(f.get("sz", 0)),
+                        "side": f.get("side", "B"),
+                        "time": int(f.get("time", 0)),
+                        "startPosition": float(f.get("startPosition", 0)),
+                        "closedPnl": float(f.get("closedPnl", 0)) if f.get("closedPnl") else None,
+                        "fee": float(f.get("fee", 0)) if f.get("fee") else None,
+                        "hash": f.get("hash"),
+                    })
+            _fills_cache[addr_lower] = btc_eth_fills
+
             result = {
                 "orders_per_day": 0.0,
-                "has_btc_eth": False,
+                "has_btc_eth": len(btc_eth_fills) > 0,
                 "fill_count": len(fills),
             }
 
             if len(fills) == 0:
                 return result
 
-            # Check for BTC/ETH fills
-            for fill in fills:
-                coin = fill.get("coin", "").upper()
-                if coin in ("BTC", "ETH"):
-                    result["has_btc_eth"] = True
-                    break
-
-            # Calculate orders per day for HFT detection
+            # Calculate orders per day for HFT detection (use all fills, not just BTC/ETH)
             orders_by_id: Dict[str, List[dict]] = {}
             for fill in fills:
                 oid = str(fill.get("oid", ""))
@@ -1055,7 +1407,7 @@ async def analyze_user_fills(
             return result
         except httpx.TimeoutException:
             if attempt < max_retries:
-                print(f"[hl-sage] Timeout on fills for {address}, retry {attempt + 1}")
+                print(f"[hl-sage] Timeout on fills for {addr_lower[:10]}..., retry {attempt + 1}")
                 await asyncio.sleep(1.0)
                 continue
             print(f"[hl-sage] Timeout analyzing fills for {address} after {max_retries + 1} attempts")
@@ -1068,6 +1420,7 @@ async def analyze_user_fills(
 
 async def fetch_leaderboard_from_api(
     limit: int = 100,
+    progress_callback: Optional[callable] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch top traders from Hyperliquid leaderboard API with quality filtering.
@@ -1083,6 +1436,7 @@ async def fetch_leaderboard_from_api(
 
     Args:
         limit: Number of qualified traders to return
+        progress_callback: Optional async callback(step, progress, processed, total) for progress updates
 
     Returns:
         List of qualified trader data sorted by 30d PnL descending
@@ -1183,12 +1537,24 @@ async def fetch_leaderboard_from_api(
             # Sort by PnL descending before API-based checks
             qualified_traders.sort(key=lambda t: t["pnl"], reverse=True)
 
+            # Report progress: initial filtering complete
+            if progress_callback:
+                await progress_callback("filtering_candidates", 10, 0, len(qualified_traders))
+
             # 5, 6, 7. API-based filters: HFT, subaccounts, and BTC/ETH trading history
             # These require individual API calls so we do them last
             final_traders = []
+            processed_count = 0
+            total_candidates = len(qualified_traders)
             for trader in qualified_traders:
                 if len(final_traders) >= limit:
                     break
+
+                processed_count += 1
+                # Report progress: processing candidates (10-80% range)
+                if progress_callback and processed_count % 5 == 0:
+                    progress = 10 + int((processed_count / total_candidates) * 70)
+                    await progress_callback("analyzing_traders", min(progress, 80), processed_count, total_candidates)
 
                 # 5 & 7. Combined fill analysis (HFT + BTC/ETH check in one API call)
                 fill_analysis = await analyze_user_fills(client, trader["address"])
@@ -1229,38 +1595,32 @@ async def fetch_leaderboard_from_api(
         return []
 
 
-@app.post("/alpha-pool/refresh")
-async def refresh_alpha_pool(
-    limit: int = Query(default=ALPHA_POOL_DEFAULT_SIZE, ge=10, le=200),
-):
+async def _do_refresh_alpha_pool(limit: int, report_progress: bool = True) -> Dict[str, Any]:
     """
-    Refresh Alpha Pool addresses from Hyperliquid leaderboard API.
+    Internal function to perform Alpha Pool refresh with progress tracking.
 
-    Fetches top traders directly from Hyperliquid (stats-data.hyperliquid.xyz)
-    and populates the alpha_pool_addresses table.
+    Args:
+        limit: Number of traders to fetch
+        report_progress: Whether to update _refresh_state with progress
 
-    Quality filters applied (7 gates):
-    1. ALPHA_POOL_MIN_PNL: Minimum 30d PnL (default $10k)
-    2. ALPHA_POOL_MIN_ROI: Minimum 30d ROI (default 10%)
-    3. ALPHA_POOL_MIN_ACCOUNT_VALUE: Minimum account value (default $100k)
-    4. ALPHA_POOL_MIN_WEEK_VLM: Minimum weekly volume to filter inactive (default $10k)
-    5. ALPHA_POOL_MAX_ORDERS_PER_DAY: Maximum orders/day to filter HFT (default 100)
-    6. No subaccounts: Filters addresses that use subaccounts (untrackable)
-    7. BTC/ETH history: Must have traded BTC or ETH (we only track these)
-
-    This is INDEPENDENT from hl-scout's leaderboard sync:
-    - Uses different API endpoint (stats-data vs hyperbot.network)
-    - Stores in different table (alpha_pool_addresses vs hl_leaderboard_entries)
-    - Can be called on-demand, not tied to daily sync schedule
-
-    The refresh deactivates addresses not in the new batch (is_active=false)
-    rather than deleting them, preserving historical data.
+    Returns:
+        Dict with refresh results
     """
+    async def progress_callback(step: str, progress: int, processed: int, total: int):
+        if report_progress:
+            await _refresh_state.update(step, progress, processed, total)
+
     try:
         # Fetch from Hyperliquid with quality filtering
-        traders = await fetch_leaderboard_from_api(limit=limit)
+        if report_progress:
+            await _refresh_state.update("fetching_leaderboard", 5, 0, 0)
+
+        traders = await fetch_leaderboard_from_api(limit=limit, progress_callback=progress_callback)
         if not traders:
-            raise HTTPException(status_code=502, detail="Failed to fetch qualified traders from Hyperliquid (check filter thresholds)")
+            raise Exception("Failed to fetch qualified traders from Hyperliquid (check filter thresholds)")
+
+        if report_progress:
+            await _refresh_state.update("saving_traders", 85, len(traders), len(traders))
 
         # Upsert into alpha_pool_addresses
         async with app.state.db.acquire() as conn:
@@ -1304,11 +1664,43 @@ async def refresh_alpha_pool(
                 new_addresses,
             )
 
+        if report_progress:
+            await _refresh_state.update("backfilling_fills", 90, len(traders), len(traders))
+
+        # Backfill historical fills for all pool addresses
+        # This ensures we have fill history for episode construction
+        print(f"[hl-sage] Starting historical fill backfill for {len(new_addresses)} addresses...")
+        backfill_results = await backfill_historical_fills_for_addresses(app.state.db, new_addresses)
+        total_fills_inserted = sum(backfill_results.values())
+        print(f"[hl-sage] Backfill complete: {total_fills_inserted} fills inserted for {len(backfill_results)} addresses")
+
+        # Clear fills cache after backfill - no longer needed and prevents stale data
+        _fills_cache.clear()
+        print(f"[hl-sage] Cleared fills cache after backfill")
+
+        if report_progress:
+            await _refresh_state.update("reconciling", 95, len(traders), len(traders))
+
+        # Notify hl-decide to reconcile the new fills into episodes
+        try:
+            async with httpx.AsyncClient() as client:
+                # Use internal Docker port 8080, not external mapped port
+                decide_url = os.getenv("DECIDE_URL", "http://hl-decide:8080")
+                response = await client.post(f"{decide_url}/reconcile", timeout=60.0)
+                if response.status_code == 200:
+                    reconcile_result = response.json()
+                    print(f"[hl-sage] hl-decide reconciliation: {reconcile_result}")
+                else:
+                    print(f"[hl-sage] hl-decide reconciliation failed: {response.status_code}")
+        except Exception as e:
+            print(f"[hl-sage] Failed to notify hl-decide for reconciliation: {e}")
+
         return {
             "success": True,
             "fetched": len(traders),
             "inserted": inserted,
             "updated": updated,
+            "fills_backfilled": total_fills_inserted,
             "filters": {
                 "min_pnl": ALPHA_POOL_MIN_PNL,
                 "min_roi": ALPHA_POOL_MIN_ROI,
@@ -1317,10 +1709,103 @@ async def refresh_alpha_pool(
                 "max_orders_per_day": ALPHA_POOL_MAX_ORDERS_PER_DAY,
             },
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to refresh alpha pool: {e}")
+        # Clear cache on error too
+        _fills_cache.clear()
+        raise
+
+
+async def _background_refresh_task(limit: int):
+    """Background task wrapper for refresh with error handling."""
+    try:
+        await _refresh_state.start()
+        result = await _do_refresh_alpha_pool(limit, report_progress=True)
+        await _refresh_state.complete(result)
+        print(f"[hl-sage] Background refresh completed: {result}")
+    except Exception as e:
+        await _refresh_state.fail(str(e))
+        print(f"[hl-sage] Background refresh failed: {e}")
+
+
+@app.get("/alpha-pool/refresh/status")
+async def get_refresh_status():
+    """
+    Get the status of the Alpha Pool refresh operation.
+
+    Returns current state including:
+    - is_running: Whether a refresh is in progress
+    - started_at: When the current/last refresh started
+    - completed_at: When the last refresh completed
+    - elapsed_seconds: Duration of current/last refresh
+    - current_step: Current operation (fetching_leaderboard, analyzing_traders, etc.)
+    - progress: Progress percentage (0-100)
+    - processed_traders: Number of traders processed so far
+    - total_traders: Total traders to process
+    - result: Final result (if completed)
+    - error: Error message (if failed)
+    """
+    return await _refresh_state.get_status()
+
+
+@app.post("/alpha-pool/refresh")
+async def refresh_alpha_pool(
+    limit: int = Query(default=ALPHA_POOL_DEFAULT_SIZE, ge=10, le=200),
+    background: bool = Query(default=True, description="Run refresh in background (non-blocking)"),
+):
+    """
+    Refresh Alpha Pool addresses from Hyperliquid leaderboard API.
+
+    Fetches top traders directly from Hyperliquid (stats-data.hyperliquid.xyz)
+    and populates the alpha_pool_addresses table.
+
+    Quality filters applied (7 gates):
+    1. ALPHA_POOL_MIN_PNL: Minimum 30d PnL (default $10k)
+    2. ALPHA_POOL_MIN_ROI: Minimum 30d ROI (default 10%)
+    3. ALPHA_POOL_MIN_ACCOUNT_VALUE: Minimum account value (default $100k)
+    4. ALPHA_POOL_MIN_WEEK_VLM: Minimum weekly volume to filter inactive (default $10k)
+    5. ALPHA_POOL_MAX_ORDERS_PER_DAY: Maximum orders/day to filter HFT (default 100)
+    6. No subaccounts: Filters addresses that use subaccounts (untrackable)
+    7. BTC/ETH history: Must have traded BTC or ETH (we only track these)
+
+    This is INDEPENDENT from hl-scout's leaderboard sync:
+    - Uses different API endpoint (stats-data vs hyperbot.network)
+    - Stores in different table (alpha_pool_addresses vs hl_leaderboard_entries)
+    - Can be called on-demand, not tied to daily sync schedule
+
+    The refresh deactivates addresses not in the new batch (is_active=false)
+    rather than deleting them, preserving historical data.
+
+    Args:
+        limit: Number of traders to fetch (default 50)
+        background: If true (default), runs in background and returns immediately.
+                   Use GET /alpha-pool/refresh/status to check progress.
+    """
+    # Check if refresh is already running
+    status = await _refresh_state.get_status()
+    if status["is_running"]:
+        raise HTTPException(
+            status_code=409,
+            detail="A refresh is already in progress. Check /alpha-pool/refresh/status for progress."
+        )
+
+    if background:
+        # Start background task and return immediately
+        asyncio.create_task(_background_refresh_task(limit))
+        return {
+            "status": "started",
+            "message": "Refresh started in background. Check /alpha-pool/refresh/status for progress.",
+            "limit": limit,
+        }
+    else:
+        # Synchronous execution (blocking)
+        try:
+            await _refresh_state.start()
+            result = await _do_refresh_alpha_pool(limit, report_progress=True)
+            await _refresh_state.complete(result)
+            return result
+        except Exception as e:
+            await _refresh_state.fail(str(e))
+            raise HTTPException(status_code=500, detail=f"Failed to refresh alpha pool: {e}")
 
 
 @app.get("/alpha-pool/addresses")

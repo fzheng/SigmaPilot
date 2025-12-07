@@ -69,7 +69,7 @@ npm run dev:stream   # hl-stream in watch mode
 ## Test
 
 ```bash
-npm run test:unit     # Run Jest unit tests (955 tests)
+npm run test:unit     # Run Jest unit tests (977 tests)
 npm run test:e2e      # Run Playwright e2e tests (requires dashboard running)
 npm test              # Run both Jest + Playwright
 npm run test:coverage # Jest with coverage report
