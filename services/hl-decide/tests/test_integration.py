@@ -833,3 +833,125 @@ class TestVoteWeighting:
                 os.environ["VOTE_WEIGHT_MODE"] = original_mode
             elif "VOTE_WEIGHT_MODE" in os.environ:
                 del os.environ["VOTE_WEIGHT_MODE"]
+
+
+class TestCorrelationRefreshIntegration:
+    """Test correlation refresh task integration."""
+
+    def test_hydrate_detector_applies_decay(self):
+        """CorrelationProvider should apply decay when hydrating detector."""
+        provider = CorrelationProvider()
+        detector = ConsensusDetector()
+
+        # Set correlations with old date (3 days ago = half-life)
+        provider.correlations[("0x1111", "0x2222")] = 0.8
+        provider._loaded_date = date.today() - timedelta(days=3)
+
+        # Hydrate with decay
+        count = provider.hydrate_detector(detector, apply_decay=True)
+
+        assert count == 1
+
+        # Check detector has decayed correlation
+        key = tuple(sorted(["0x1111", "0x2222"]))
+        decayed_rho = detector.correlation_matrix.get(key)
+
+        # At 3 days (half-life), decay = 0.5
+        # Decayed = 0.8 * 0.5 + 0.3 * 0.5 = 0.55
+        assert decayed_rho is not None
+        assert 0.5 < decayed_rho < 0.7  # Should be around 0.55
+
+    def test_hydrate_detector_without_decay(self):
+        """CorrelationProvider should preserve raw values when apply_decay=False."""
+        provider = CorrelationProvider()
+        detector = ConsensusDetector()
+
+        # Set correlations with old date
+        provider.correlations[("0x1111", "0x2222")] = 0.8
+        provider._loaded_date = date.today() - timedelta(days=3)
+
+        # Hydrate WITHOUT decay
+        count = provider.hydrate_detector(detector, apply_decay=False)
+
+        assert count == 1
+
+        # Check detector has raw correlation
+        key = tuple(sorted(["0x1111", "0x2222"]))
+        raw_rho = detector.correlation_matrix.get(key)
+
+        assert raw_rho == 0.8  # No decay applied
+
+    def test_hydrate_detector_with_fresh_data(self):
+        """Fresh data should have minimal decay."""
+        provider = CorrelationProvider()
+        detector = ConsensusDetector()
+
+        # Set correlations with today's date
+        provider.correlations[("0x1111", "0x2222")] = 0.8
+        provider._loaded_date = date.today()
+
+        # Hydrate with decay
+        count = provider.hydrate_detector(detector, apply_decay=True)
+
+        assert count == 1
+
+        # Check detector has nearly raw correlation (fresh data = no decay)
+        key = tuple(sorted(["0x1111", "0x2222"]))
+        fresh_rho = detector.correlation_matrix.get(key)
+
+        assert fresh_rho is not None
+        assert fresh_rho >= 0.79  # Almost no decay
+
+    def test_detector_uses_hydrated_correlations_in_effk(self):
+        """Hydrated correlations should affect effective-K calculation."""
+        provider = CorrelationProvider()
+        detector = ConsensusDetector()
+
+        # Set high correlation between two traders
+        provider.correlations[("0xaaa", "0xbbb")] = 0.9
+        provider._loaded_date = date.today()
+
+        provider.hydrate_detector(detector, apply_decay=False)
+
+        # Calculate effK with two highly correlated traders
+        weights = {"0xaaa": 1.0, "0xbbb": 1.0}
+        eff_k = detector.eff_k_from_corr(weights)
+
+        # High correlation → lower effK
+        # effK = (1+1)² / (1*1 + 1*1 + 2*1*1*0.9) = 4 / 3.8 ≈ 1.05
+        assert 1.0 < eff_k < 1.5
+
+    def test_detector_effk_with_independent_traders(self):
+        """Independent traders should give full effK."""
+        provider = CorrelationProvider()
+        detector = ConsensusDetector()
+
+        # No correlation data = default ρ = 0.3
+        provider._loaded_date = date.today()
+        provider.hydrate_detector(detector, apply_decay=False)
+
+        # Calculate effK with two uncorrelated traders
+        weights = {"0xindep1": 1.0, "0xindep2": 1.0}
+        eff_k = detector.eff_k_from_corr(weights)
+
+        # No stored correlation uses default (0.3)
+        # effK = 4 / (1 + 1 + 2*0.3) = 4 / 2.6 ≈ 1.54
+        assert 1.5 < eff_k < 2.0
+
+
+class TestBackgroundTaskConfiguration:
+    """Test configuration for background tasks."""
+
+    def test_correlation_refresh_interval_default(self):
+        """Default correlation refresh interval should be 24 hours."""
+        # Import to check default value
+        from app.main import CORR_REFRESH_INTERVAL_HOURS
+
+        # Default is 24 hours
+        assert CORR_REFRESH_INTERVAL_HOURS == 24
+
+    def test_reconcile_interval_default(self):
+        """Default reconciliation interval should be 6 hours."""
+        from app.main import RECONCILE_INTERVAL_HOURS
+
+        assert RECONCILE_INTERVAL_HOURS == 6

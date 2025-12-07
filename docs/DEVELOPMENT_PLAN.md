@@ -177,7 +177,7 @@ Replaced all placeholder implementations with production-ready components:
 - [x] **ATR Provider** (`hl-decide/app/atr.py`): Dynamic stop distances from market volatility
 - [x] **Correlation Job** (`hl-decide/app/correlation.py`): Daily pairwise correlation computation
 - [x] **Episode Tracker** (`hl-decide/app/episode.py`): Position lifecycle with R-multiple calculation
-- [x] **Integration Tests** (`test_integration.py`): 22 tests covering complete signal flow
+- [x] **Integration Tests** (`test_integration.py`): 41 tests covering complete signal flow
 - [x] **Operational Runbook** (`docs/RUNBOOK.md`): Health checks, monitoring, troubleshooting
 
 **Test Coverage**:
@@ -187,9 +187,10 @@ Replaced all placeholder implementations with production-ready components:
 | ATR Provider | 29 | `hl-decide/tests/test_atr.py` |
 | Correlation | 40 | `hl-decide/tests/test_correlation.py` |
 | Episode Builder | 30 | `hl-decide/tests/test_episode.py` |
-| Integration | 22 | `hl-decide/tests/test_integration.py` |
-| **Total Python** | **146** | |
-| TypeScript Unit | 977 | `tests/*.test.ts` |
+| Integration | 41 | `hl-decide/tests/test_integration.py` |
+| **Total Python** | **151** | |
+| TypeScript Unit | 973 | `tests/*.test.ts` |
+| E2E (Playwright) | 150 | `e2e/*.spec.ts` |
 
 **Alpha Pool Architecture (Decoupled)**:
 The Alpha Pool is now a completely independent system from the legacy leaderboard:
@@ -884,6 +885,7 @@ Based on peer quant review, the following robustness improvements were implement
 - [x] **Freshness check**: `check_freshness()` returns (is_fresh, message) for operational monitoring.
 - [x] **Default usage tracking**: Provider tracks how many times default correlation was used (`_default_used_count`).
 - [x] **Hydrate with decay**: `hydrate_detector(apply_decay=True)` applies decay when loading correlations into ConsensusDetector.
+- [x] **Periodic correlation refresh**: Background task (`periodic_correlation_refresh_task`) recomputes correlations daily (configurable via `CORR_REFRESH_INTERVAL_HOURS`, default 24h).
 
 **Vote Weighting Improvements**:
 - [x] **Logarithmic scaling**: Default mode (`VOTE_WEIGHT_MODE=log`) uses `log(1 + notional/base)` to smooth large vs small positions.
@@ -918,6 +920,7 @@ ATR_REALIZED_VOL_MIN_SAMPLES=60   # Min candles for realized vol calculation
 CORR_MAX_STALENESS_DAYS=7       # Max age before full fallback
 CORR_DECAY_HALFLIFE_DAYS=3.0    # Half-life for exponential decay
 DEFAULT_CORRELATION=0.3          # Used when data missing or very stale
+CORR_REFRESH_INTERVAL_HOURS=24  # Daily refresh (background task)
 
 # Vote weighting
 VOTE_WEIGHT_MODE=log            # "log" (default), "equity", or "linear"

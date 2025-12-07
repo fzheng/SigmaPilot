@@ -154,10 +154,10 @@ Key configuration (see `.env.example`):
 
 ## Testing
 
-- **TypeScript**: Jest (977 tests)
-- **Python**: pytest (144 tests)
+- **TypeScript**: Jest (973 tests)
+- **Python**: pytest (151 tests)
 - **E2E**: Playwright (150 tests)
-- **Coverage**: ~76% overall, ~97% for ts-lib
+- **Coverage**: ~76% overall, ~89% for ts-lib
 
 ```bash
 make test            # All tests
