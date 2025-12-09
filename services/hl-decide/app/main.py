@@ -1719,6 +1719,93 @@ async def health():
         return {"status": "ok", "scores": len(scores), "fills": len(fills)}
 
 
+@app.get("/data-health")
+async def data_health():
+    """
+    Data freshness and health status endpoint.
+    Returns warnings for stale data that could affect signal quality.
+    Used for observability dashboards and alerting.
+    """
+    from datetime import datetime, timezone
+
+    warnings = []
+    status = "healthy"
+
+    # ATR staleness check
+    atr_health = {"btc": {"status": "unknown"}, "eth": {"status": "unknown"}}
+    if hasattr(app.state, "atr_provider"):
+        provider = app.state.atr_provider
+        for asset in ["BTC", "ETH"]:
+            atr_data = provider.get_atr(asset)
+            if atr_data:
+                age_seconds = atr_data.get("age_seconds", 0)
+                source = atr_data.get("source", "unknown")
+                atr_health[asset.lower()] = {
+                    "status": "stale" if age_seconds > ATR_MAX_STALENESS else "fresh",
+                    "age_seconds": age_seconds,
+                    "source": source,
+                    "value": atr_data.get("atr"),
+                }
+                if age_seconds > ATR_MAX_STALENESS:
+                    warnings.append(f"ATR for {asset} is stale ({age_seconds}s old, max {ATR_MAX_STALENESS}s)")
+                    status = "degraded"
+            else:
+                atr_health[asset.lower()] = {"status": "missing"}
+                warnings.append(f"No ATR data available for {asset}")
+                status = "degraded"
+
+    # Correlation health check
+    corr_health = {"status": "unknown", "coverage_pct": 0, "pairs_loaded": 0}
+    if hasattr(app.state, "corr_provider"):
+        provider = app.state.corr_provider
+        pairs_loaded = len(provider.correlations) if hasattr(provider, "correlations") else 0
+        pool_size = getattr(provider, "pool_size", 0)
+
+        # Calculate coverage
+        expected_pairs = pool_size * (pool_size - 1) // 2 if pool_size > 1 else 0
+        coverage_pct = (pairs_loaded / expected_pairs * 100) if expected_pairs > 0 else 0
+
+        corr_health = {
+            "status": "healthy" if coverage_pct >= 50 else ("degraded" if coverage_pct > 0 else "missing"),
+            "coverage_pct": round(coverage_pct, 1),
+            "pairs_loaded": pairs_loaded,
+            "pool_size": pool_size,
+            "expected_pairs": expected_pairs,
+        }
+
+        if coverage_pct < 50:
+            warnings.append(f"Correlation coverage low ({coverage_pct:.1f}%, using default ρ=0.3 for missing pairs)")
+            if status == "healthy":
+                status = "degraded"
+
+    # Weight concentration check (from recent consensus)
+    weight_health = {"gini": None, "saturation_pct": None}
+    try:
+        # Get last Gini from metrics if available
+        gini_value = weight_gini_gauge._value.get() if weight_gini_gauge._value else None
+        sat_pct = weight_saturation_pct_gauge._value.get() if weight_saturation_pct_gauge._value else None
+        weight_health = {
+            "gini": round(gini_value, 3) if gini_value is not None else None,
+            "saturation_pct": round(sat_pct, 1) if sat_pct is not None else None,
+        }
+        if gini_value is not None and gini_value > 0.8:
+            warnings.append(f"Vote weight concentration high (Gini={gini_value:.2f})")
+            if status == "healthy":
+                status = "degraded"
+    except Exception:
+        pass
+
+    return {
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "atr": atr_health,
+        "correlation": corr_health,
+        "weight_distribution": weight_health,
+        "warnings": warnings,
+        "warning_count": len(warnings),
+    }
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
