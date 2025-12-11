@@ -107,15 +107,32 @@ export class RealtimeTracker {
     ws.on('message', (data: any) => {
       try {
         const msg = JSON.parse(data.toString());
-        // Route user events to the appropriate handler
+        // Route user events to the appropriate handler based on user address
         if (msg.channel === 'user' && msg.data?.fills) {
-          // Find which user this belongs to by checking fills
-          for (const fill of msg.data.fills) {
-            // Fills don't contain user address directly, so we broadcast to all handlers
-            for (const handler of slot.handlers.values()) {
+          // Extract user address from the subscription info in the message
+          // Hyperliquid sends user in msg.data.user or we can match against our known users
+          const msgUser = msg.data?.user?.toLowerCase();
+          if (msgUser) {
+            // Route to specific handler for this user
+            const handler = slot.handlers.get(msgUser);
+            if (handler) {
               handler(msg.data);
             }
-            break; // Only process once
+          } else {
+            // Fallback: try to identify user from fills if msg.data.user is not present
+            // This shouldn't normally happen but provides safety
+            console.warn('[realtime] userEvents message missing user field, checking fills');
+            for (const fill of msg.data.fills) {
+              // Check if any fill has a user field
+              const fillUser = fill?.user?.toLowerCase();
+              if (fillUser) {
+                const handler = slot.handlers.get(fillUser);
+                if (handler) {
+                  handler(msg.data);
+                }
+                break;
+              }
+            }
           }
         }
       } catch {}
@@ -180,11 +197,29 @@ export class RealtimeTracker {
       newWs.on('message', (data: any) => {
         try {
           const msg = JSON.parse(data.toString());
-          // Route user events to the appropriate handler
+          // Route user events to the appropriate handler based on user address
           if (msg.channel === 'user' && msg.data?.fills) {
-            // Fills don't contain user address directly, so we broadcast to all handlers
-            for (const handler of slot.handlers.values()) {
-              handler(msg.data);
+            // Extract user address from the message
+            const msgUser = msg.data?.user?.toLowerCase();
+            if (msgUser) {
+              // Route to specific handler for this user
+              const handler = slot.handlers.get(msgUser);
+              if (handler) {
+                handler(msg.data);
+              }
+            } else {
+              // Fallback: try to identify user from fills if msg.data.user is not present
+              console.warn('[realtime] reconnect: userEvents message missing user field, checking fills');
+              for (const fill of msg.data.fills) {
+                const fillUser = fill?.user?.toLowerCase();
+                if (fillUser) {
+                  const handler = slot.handlers.get(fillUser);
+                  if (handler) {
+                    handler(msg.data);
+                  }
+                  break;
+                }
+              }
             }
           }
         } catch {}

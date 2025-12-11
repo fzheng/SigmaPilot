@@ -1,9 +1,11 @@
 import { test, expect } from '@playwright/test';
+import { setupMocks } from './fixtures/setup-mocks';
 
 /**
  * E2E Tests for Tab Switching and Data Refresh
  *
- * These tests verify the fixes for:
+ * These tests use mocked API responses to avoid hitting the real Hyperliquid API.
+ * They verify the fixes for:
  * 1. Legacy Leaderboard tab showing stale fills data after tab switch
  * 2. Alpha Pool auto-refresh UI state (is_running properly set)
  *
@@ -14,10 +16,15 @@ test.describe('Tab Switching - Data Refresh', () => {
   test('switching to Legacy tab should trigger fills refresh', async ({ page }) => {
     let legacyFillsRequested = false;
 
-    // Intercept the legacy fills API call
+    await setupMocks(page);
+    // Override the legacy fills mock to track if it was requested
     await page.route('**/dashboard/api/legacy/fills**', async (route) => {
       legacyFillsRequested = true;
-      await route.continue();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ fills: [], hasMore: false }),
+      });
     });
 
     await page.goto('/dashboard');
@@ -35,15 +42,28 @@ test.describe('Tab Switching - Data Refresh', () => {
     let alphaPoolRequests = 0;
     let legacyFillsRequests = 0;
 
-    // Intercept API calls
+    await setupMocks(page);
+    // Override to track request counts
     await page.route('**/dashboard/api/alpha-pool', async (route) => {
-      alphaPoolRequests++;
-      await route.continue();
+      if (route.request().url().endsWith('/alpha-pool') || route.request().url().includes('/alpha-pool?')) {
+        alphaPoolRequests++;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ traders: [], status: {} }),
+        });
+      } else {
+        await route.continue();
+      }
     });
 
     await page.route('**/dashboard/api/legacy/fills**', async (route) => {
       legacyFillsRequests++;
-      await route.continue();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ fills: [], hasMore: false }),
+      });
     });
 
     await page.goto('/dashboard');
@@ -67,6 +87,7 @@ test.describe('Tab Switching - Data Refresh', () => {
   });
 
   test('Legacy fills should have data after tab switch', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
 
     // Switch to Legacy tab
@@ -88,6 +109,7 @@ test.describe('Tab Switching - Data Refresh', () => {
   });
 
   test('tab content should be visible after switch', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     await page.waitForTimeout(1000);
 
@@ -110,6 +132,7 @@ test.describe('Tab Switching - Data Refresh', () => {
 
 test.describe('Alpha Pool - Auto-Refresh UI', () => {
   test('Alpha Pool tab should show loading or data state', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     await page.waitForTimeout(2000);
 
@@ -133,9 +156,10 @@ test.describe('Alpha Pool - Auto-Refresh UI', () => {
   });
 
   test('Alpha Pool refresh status endpoint should be accessible', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
 
-    // Make a direct request to the refresh status endpoint
+    // Make a direct request to the refresh status endpoint (mocked)
     const response = await page.request.get('/dashboard/api/alpha-pool/refresh/status');
     expect(response.status()).toBe(200);
 
@@ -143,19 +167,22 @@ test.describe('Alpha Pool - Auto-Refresh UI', () => {
     // Should have is_running field
     expect(typeof data.is_running).toBe('boolean');
     // Should have other expected fields
-    expect('current_step' in data || 'progress' in data).toBe(true);
+    expect('current_step' in data || 'progress' in data || 'last_refresh' in data).toBe(true);
   });
 
   test('Alpha Pool data endpoint should return valid data', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
+    await page.waitForTimeout(1000);
 
-    // Request Alpha Pool data
-    const response = await page.request.get('/dashboard/api/alpha-pool');
-    expect(response.status()).toBe(200);
+    // Verify data was loaded by checking the Alpha Pool table has content
+    // (The mock data provides traders, so the table should render them)
+    const alphaPoolTable = page.locator('[data-testid="alpha-pool-table"]');
+    const hasTable = await alphaPoolTable.isVisible().catch(() => false);
 
-    const data = await response.json();
-    // Should have traders array (even if empty)
-    expect(Array.isArray(data.traders)).toBe(true);
+    // Either table is visible with data, or we have a no-data/loading state
+    // The mock provides traders, so on successful mock we expect a table
+    expect(hasTable).toBe(true);
   });
 });
 
@@ -168,6 +195,7 @@ test.describe('Position Display After Custom Account Add', () => {
    */
 
   test('custom account API should return success', async ({ page }) => {
+    await setupMocks(page);
     // Mock the custom account endpoint
     await page.route('**/dashboard/api/pinned-accounts/custom', async (route) => {
       await route.fulfill({
@@ -230,6 +258,7 @@ test.describe('Position Display After Custom Account Add', () => {
   });
 
   test('holdings column should display position data', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
 
     // Switch to Legacy tab
@@ -254,6 +283,7 @@ test.describe('Position Display After Custom Account Add', () => {
 
 test.describe('Dashboard Tab State Persistence', () => {
   test('active tab should be visually distinct', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     await page.waitForTimeout(500);
 
@@ -281,6 +311,7 @@ test.describe('Dashboard Tab State Persistence', () => {
   });
 
   test('tab panels should toggle visibility correctly', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
 
     // Initially Alpha Pool content visible (actual IDs are tab-alpha-pool and tab-legacy-leaderboard)

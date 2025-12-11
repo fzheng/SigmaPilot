@@ -21,6 +21,7 @@ Position Lifecycle:
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, Optional, Union
 from uuid import uuid4
@@ -65,7 +66,110 @@ NIG_PRIOR_KAPPA = 1.0
 NIG_PRIOR_ALPHA = 3.0
 NIG_PRIOR_BETA = 1.0
 
-app = FastAPI(title="hl-decide", version="0.3.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
+    # Startup
+    try:
+        # Connect to database first
+        app.state.db = await asyncpg.create_pool(DB_URL)
+
+        # Ensure episode_fill_ids table exists for deduplication
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episode_fill_ids (
+                    fill_id TEXT PRIMARY KEY,
+                    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+                """
+            )
+        print("[hl-decide] episode_fill_ids table ready for deduplication")
+
+        # Initialize ATR provider for dynamic stop distances
+        app.state.atr_provider = init_atr_provider(app.state.db)
+        print("[hl-decide] ATR provider initialized")
+
+        # Initialize correlation provider and hydrate consensus detector
+        app.state.corr_provider = init_correlation_provider(app.state.db)
+        corr_count = await app.state.corr_provider.load()
+        if corr_count > 0:
+            hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+            update_correlation_metrics(app.state.corr_provider)
+            print(f"[hl-decide] Loaded {corr_count} correlations, hydrated detector with {hydrated} pairs")
+        else:
+            # No correlations found - try to compute them on first startup
+            print("[hl-decide] No correlations found, computing initial correlations...")
+            try:
+                summary = await run_daily_correlation_job(app.state.db)
+                total_pairs = summary.get("btc_pairs", 0) + summary.get("eth_pairs", 0)
+                if total_pairs > 0:
+                    corr_count = await app.state.corr_provider.load()
+                    hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+                    update_correlation_metrics(app.state.corr_provider)
+                    print(f"[hl-decide] Computed {total_pairs} correlations, hydrated detector with {hydrated} pairs")
+                else:
+                    print("[hl-decide] No correlations computed (insufficient data, using default ρ=0.3)")
+            except Exception as corr_error:
+                print(f"[hl-decide] Correlation computation failed (using default ρ=0.3): {corr_error}")
+
+        # Restore state from database
+        score_count, fill_count = await restore_state()
+        print(f"[hl-decide] Restored {score_count} scores and {fill_count} fills from database")
+
+        # Bootstrap episodes from historical fills (hl_events table)
+        # This processes fills that were loaded via backfill, not real-time NATS
+        bootstrap_count = await bootstrap_from_historical_fills()
+
+        # Count open positions
+        async with app.state.db.acquire() as conn:
+            open_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM position_signals WHERE status = 'open'"
+            )
+            print(f"[hl-decide] {open_count} open positions being tracked")
+
+        # Load initial ATR data for consensus detector
+        await update_atr_for_consensus()
+
+        # Connect to NATS
+        app.state.nc = await nats.connect(NATS_URL)
+        app.state.js = app.state.nc.jetstream()
+        await ensure_stream(app.state.js, "HL_D", ["d.signals.v1", "d.outcomes.v1"])
+        await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
+        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
+
+        # Start periodic background tasks
+        app.state.reconcile_task = asyncio.create_task(periodic_reconciliation_task())
+        app.state.corr_refresh_task = asyncio.create_task(periodic_correlation_refresh_task())
+        print(f"[hl-decide] Periodic reconciliation scheduled every {RECONCILE_INTERVAL_HOURS} hours")
+        print(f"[hl-decide] Correlation refresh scheduled every {CORR_REFRESH_INTERVAL_HOURS} hours")
+
+        print("[hl-decide] Started with position-based tracking, ATR stops, and correlation matrix")
+    except Exception as e:
+        print(f"[hl-decide] Fatal startup error: {e}")
+        raise
+
+    yield  # Application runs here
+
+    # Shutdown
+    # Cancel periodic background tasks
+    for task_name in ["reconcile_task", "corr_refresh_task"]:
+        if hasattr(app.state, task_name):
+            task = getattr(app.state, task_name)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    if hasattr(app.state, "nc"):
+        await app.state.nc.drain()
+    if hasattr(app.state, "db"):
+        await app.state.db.close()
+
+
+app = FastAPI(title="hl-decide", version="0.3.0", lifespan=lifespan)
 scores: OrderedDict[str, ScoreEvent] = OrderedDict()
 fills: OrderedDict[str, FillEvent] = OrderedDict()
 
@@ -1599,106 +1703,6 @@ async def handle_consensus_signal(signal: ConsensusSignal) -> None:
 
     except Exception as e:
         print(f"[hl-decide] Failed to handle consensus signal: {e}")
-
-
-@app.on_event("startup")
-async def startup():
-    try:
-        # Connect to database first
-        app.state.db = await asyncpg.create_pool(DB_URL)
-
-        # Ensure episode_fill_ids table exists for deduplication
-        async with app.state.db.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS episode_fill_ids (
-                    fill_id TEXT PRIMARY KEY,
-                    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                )
-                """
-            )
-        print("[hl-decide] episode_fill_ids table ready for deduplication")
-
-        # Initialize ATR provider for dynamic stop distances
-        app.state.atr_provider = init_atr_provider(app.state.db)
-        print("[hl-decide] ATR provider initialized")
-
-        # Initialize correlation provider and hydrate consensus detector
-        app.state.corr_provider = init_correlation_provider(app.state.db)
-        corr_count = await app.state.corr_provider.load()
-        if corr_count > 0:
-            hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
-            update_correlation_metrics(app.state.corr_provider)
-            print(f"[hl-decide] Loaded {corr_count} correlations, hydrated detector with {hydrated} pairs")
-        else:
-            # No correlations found - try to compute them on first startup
-            print("[hl-decide] No correlations found, computing initial correlations...")
-            try:
-                summary = await run_daily_correlation_job(app.state.db)
-                total_pairs = summary.get("btc_pairs", 0) + summary.get("eth_pairs", 0)
-                if total_pairs > 0:
-                    corr_count = await app.state.corr_provider.load()
-                    hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
-                    update_correlation_metrics(app.state.corr_provider)
-                    print(f"[hl-decide] Computed {total_pairs} correlations, hydrated detector with {hydrated} pairs")
-                else:
-                    print("[hl-decide] No correlations computed (insufficient data, using default ρ=0.3)")
-            except Exception as corr_error:
-                print(f"[hl-decide] Correlation computation failed (using default ρ=0.3): {corr_error}")
-
-        # Restore state from database
-        score_count, fill_count = await restore_state()
-        print(f"[hl-decide] Restored {score_count} scores and {fill_count} fills from database")
-
-        # Bootstrap episodes from historical fills (hl_events table)
-        # This processes fills that were loaded via backfill, not real-time NATS
-        bootstrap_count = await bootstrap_from_historical_fills()
-
-        # Count open positions
-        async with app.state.db.acquire() as conn:
-            open_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM position_signals WHERE status = 'open'"
-            )
-            print(f"[hl-decide] {open_count} open positions being tracked")
-
-        # Load initial ATR data for consensus detector
-        await update_atr_for_consensus()
-
-        # Connect to NATS
-        app.state.nc = await nats.connect(NATS_URL)
-        app.state.js = app.state.nc.jetstream()
-        await ensure_stream(app.state.js, "HL_D", ["d.signals.v1", "d.outcomes.v1"])
-        await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
-        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
-
-        # Start periodic background tasks
-        app.state.reconcile_task = asyncio.create_task(periodic_reconciliation_task())
-        app.state.corr_refresh_task = asyncio.create_task(periodic_correlation_refresh_task())
-        print(f"[hl-decide] Periodic reconciliation scheduled every {RECONCILE_INTERVAL_HOURS} hours")
-        print(f"[hl-decide] Correlation refresh scheduled every {CORR_REFRESH_INTERVAL_HOURS} hours")
-
-        print("[hl-decide] Started with position-based tracking, ATR stops, and correlation matrix")
-    except Exception as e:
-        print(f"[hl-decide] Fatal startup error: {e}")
-        raise
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    # Cancel periodic background tasks
-    for task_name in ["reconcile_task", "corr_refresh_task"]:
-        if hasattr(app.state, task_name):
-            task = getattr(app.state, task_name)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-    if hasattr(app.state, "nc"):
-        await app.state.nc.drain()
-    if hasattr(app.state, "db"):
-        await app.state.db.close()
 
 
 @app.get("/healthz")

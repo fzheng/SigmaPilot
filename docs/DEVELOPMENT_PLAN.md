@@ -44,7 +44,7 @@ Leaderboard → Quality Filter → Alpha Pool → Thompson Sampling → Consensu
 **Test Coverage:**
 - TypeScript: 973 unit tests
 - Python: 164 tests (151 + 13 risk limits)
-- E2E: 150 Playwright tests
+- E2E: 110 Playwright tests (6 spec files)
 
 ### Phase 3c Additions (December 2025)
 
@@ -87,6 +87,12 @@ Leaderboard → Quality Filter → Alpha Pool → Thompson Sampling → Consensu
 - Hourly check determines if refresh is due
 - Consensus signals polled every 60 seconds in frontend
 - Real API calls replace mock data in dashboard
+
+**Alpha Pool Fill Backfill (Phase 3d):**
+- New addresses automatically get historical fills backfilled on first add
+- Manual backfill endpoint: `POST /alpha-pool/backfill/{address}`
+- Backfill fetches fills from Hyperliquid API and stores in `hl_events`
+- Only genuinely new addresses are backfilled (not re-activated addresses)
 
 ---
 

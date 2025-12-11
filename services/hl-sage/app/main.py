@@ -35,6 +35,7 @@ To populate the Alpha Pool:
 import os
 import json
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from collections import OrderedDict
@@ -69,7 +70,52 @@ MAX_TRACKED_ADDRESSES = int(os.getenv("MAX_TRACKED_ADDRESSES", "1000"))
 MAX_SCORES = int(os.getenv("MAX_SCORES", "500"))
 STALE_THRESHOLD_HOURS = int(os.getenv("STALE_THRESHOLD_HOURS", "24"))
 
-app = FastAPI(title="hl-sage", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
+    # Startup
+    try:
+        # Connect to database first
+        app.state.db = await asyncpg.create_pool(DB_URL)
+
+        # Restore tracked addresses from database
+        restored = await restore_tracked_addresses()
+        print(f"[hl-sage] Restored {restored} tracked addresses from database")
+
+        # Connect to NATS
+        app.state.nc = await nats.connect(NATS_URL)
+        app.state.js = app.state.nc.jetstream()
+        await ensure_stream(app.state.js, "HL_B", ["b.scores.v1"])
+        await app.state.nc.subscribe("a.candidates.v1", cb=handle_candidate)
+        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
+
+        # Auto-refresh Alpha Pool if empty on startup
+        if ALPHA_POOL_AUTO_REFRESH:
+            asyncio.create_task(auto_refresh_alpha_pool_if_empty())
+
+        # Start periodic fill sync for Alpha Pool addresses
+        asyncio.create_task(periodic_alpha_pool_fill_sync())
+
+        # Start subscription sync to register Alpha Pool addresses with hl-stream
+        asyncio.create_task(sync_alpha_pool_subscriptions())
+
+        # Start periodic Alpha Pool refresh (every ALPHA_POOL_REFRESH_HOURS)
+        asyncio.create_task(periodic_alpha_pool_refresh())
+    except Exception as e:
+        print(f"[hl-sage] Fatal startup error: {e}")
+        raise
+
+    yield  # Application runs here
+
+    # Shutdown
+    if hasattr(app.state, "nc"):
+        await app.state.nc.drain()
+    if hasattr(app.state, "db"):
+        await app.state.db.close()
+
+
+app = FastAPI(title="hl-sage", version="0.1.0", lifespan=lifespan)
 
 # Use OrderedDict for LRU behavior
 scores: OrderedDict[str, ScoreEvent] = OrderedDict()
@@ -356,40 +402,6 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
 ALPHA_POOL_AUTO_REFRESH = os.getenv("ALPHA_POOL_AUTO_REFRESH", "true").lower() == "true"
 
 
-@app.on_event("startup")
-async def startup_event():
-    try:
-        # Connect to database first
-        app.state.db = await asyncpg.create_pool(DB_URL)
-
-        # Restore tracked addresses from database
-        restored = await restore_tracked_addresses()
-        print(f"[hl-sage] Restored {restored} tracked addresses from database")
-
-        # Connect to NATS
-        app.state.nc = await nats.connect(NATS_URL)
-        app.state.js = app.state.nc.jetstream()
-        await ensure_stream(app.state.js, "HL_B", ["b.scores.v1"])
-        await app.state.nc.subscribe("a.candidates.v1", cb=handle_candidate)
-        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
-
-        # Auto-refresh Alpha Pool if empty on startup
-        if ALPHA_POOL_AUTO_REFRESH:
-            asyncio.create_task(auto_refresh_alpha_pool_if_empty())
-
-        # Start periodic fill sync for Alpha Pool addresses
-        asyncio.create_task(periodic_alpha_pool_fill_sync())
-
-        # Start subscription sync to register Alpha Pool addresses with hl-stream
-        asyncio.create_task(sync_alpha_pool_subscriptions())
-
-        # Start periodic Alpha Pool refresh (every ALPHA_POOL_REFRESH_HOURS)
-        asyncio.create_task(periodic_alpha_pool_refresh())
-    except Exception as e:
-        print(f"[hl-sage] Fatal startup error: {e}")
-        raise
-
-
 async def auto_refresh_alpha_pool_if_empty():
     """
     Auto-refresh Alpha Pool on startup ONLY if it has NEVER been refreshed.
@@ -664,14 +676,6 @@ async def periodic_alpha_pool_refresh():
 
         # Check every hour
         await asyncio.sleep(3600)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if hasattr(app.state, "nc"):
-        await app.state.nc.drain()
-    if hasattr(app.state, "db"):
-        await app.state.db.close()
 
 
 @app.get("/healthz")
@@ -1917,11 +1921,18 @@ async def _do_refresh_alpha_pool(limit: int, report_progress: bool = True) -> Di
         if report_progress:
             await _refresh_state.update("saving_traders", 85, len(traders), len(traders))
 
-        # Upsert into alpha_pool_addresses
+        # Upsert into alpha_pool_addresses and track newly inserted addresses
+        newly_inserted_addresses = []
         async with app.state.db.acquire() as conn:
             inserted = 0
             updated = 0
             for trader in traders:
+                # Check if address already exists
+                existing = await conn.fetchval(
+                    "SELECT 1 FROM alpha_pool_addresses WHERE address = $1",
+                    trader["address"],
+                )
+
                 result = await conn.execute(
                     """
                     INSERT INTO alpha_pool_addresses (address, nickname, account_value, pnl_30d, roi_30d, win_rate, last_refreshed, is_active)
@@ -1942,8 +1953,9 @@ async def _do_refresh_alpha_pool(limit: int, report_progress: bool = True) -> Di
                     trader.get("roi", 0.0),
                     trader["win_rate"],
                 )
-                if "INSERT" in result:
+                if not existing:
                     inserted += 1
+                    newly_inserted_addresses.append(trader["address"])
                 else:
                     updated += 1
 
@@ -1962,12 +1974,15 @@ async def _do_refresh_alpha_pool(limit: int, report_progress: bool = True) -> Di
         if report_progress:
             await _refresh_state.update("backfilling_fills", 90, len(traders), len(traders))
 
-        # Backfill historical fills for all pool addresses
-        # This ensures we have fill history for episode construction
-        print(f"[hl-sage] Starting historical fill backfill for {len(new_addresses)} addresses...")
-        backfill_results = await backfill_historical_fills_for_addresses(app.state.db, new_addresses)
-        total_fills_inserted = sum(backfill_results.values())
-        print(f"[hl-sage] Backfill complete: {total_fills_inserted} fills inserted for {len(backfill_results)} addresses")
+        # Backfill historical fills for NEWLY INSERTED addresses only
+        # Existing addresses should already have their fills from previous backfills
+        if newly_inserted_addresses:
+            print(f"[hl-sage] Starting historical fill backfill for {len(newly_inserted_addresses)} NEW addresses...")
+            backfill_results = await backfill_historical_fills_for_addresses(app.state.db, newly_inserted_addresses)
+            total_fills_inserted = sum(backfill_results.values())
+            print(f"[hl-sage] Backfill complete: {total_fills_inserted} fills inserted for {len(backfill_results)} addresses")
+        else:
+            print(f"[hl-sage] No new addresses to backfill (all {len(traders)} addresses already existed)")
 
         # Clear fills cache after backfill - no longer needed and prevents stale data
         _fills_cache.clear()
@@ -2143,3 +2158,41 @@ async def list_alpha_pool_addresses(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list addresses: {e}")
+
+
+@app.post("/alpha-pool/backfill/{address}")
+async def backfill_address_fills(address: str):
+    """
+    Backfill historical fills for a specific address.
+
+    This fetches fills from Hyperliquid API and stores them in hl_events.
+    Useful for:
+    - Addresses that were added to the pool but backfill failed
+    - Inactive addresses that need historical data
+    - Manual data recovery
+
+    The address must exist in alpha_pool_addresses (active or inactive).
+    """
+    addr_lower = address.lower()
+
+    # Verify address is in the pool (active or inactive)
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT address, is_active FROM alpha_pool_addresses WHERE address = $1",
+            addr_lower,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Address {address} not found in Alpha Pool")
+
+    # Perform backfill
+    try:
+        results = await backfill_historical_fills_for_addresses(app.state.db, [addr_lower])
+        inserted = results.get(addr_lower, 0)
+        return {
+            "address": addr_lower,
+            "fills_inserted": inserted,
+            "is_active": row["is_active"],
+            "message": f"Backfilled {inserted} fills for {addr_lower[:10]}...",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to backfill: {e}")

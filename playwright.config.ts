@@ -35,7 +35,11 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // Increase navigation timeout for more reliable tests
+        navigationTimeout: 45 * 1000,
+      },
     },
     /* Uncomment to add more browsers
     {
@@ -50,7 +54,11 @@ export default defineConfig({
     /* Test against mobile viewports */
     {
       name: 'mobile-chrome',
-      use: { ...devices['Pixel 5'] },
+      use: {
+        ...devices['Pixel 5'],
+        // Mobile tests need longer timeout due to slower resource loading (TradingView, etc.)
+        navigationTimeout: 60 * 1000,
+      },
     },
   ],
 
@@ -63,8 +71,8 @@ export default defineConfig({
   //   timeout: 120 * 1000,
   // },
 
-  /* Timeout for each test */
-  timeout: 30 * 1000,
+  /* Timeout for each test - increased for reliability with TradingView charts */
+  timeout: 45 * 1000,
 
   /* Expect timeout */
   expect: {
