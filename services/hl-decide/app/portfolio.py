@@ -489,4 +489,4 @@ async def get_execution_logs(
             }
     except Exception as e:
         print(f"[portfolio] Failed to get execution logs: {e}")
-        return {"total": 0, "limit": limit, "offset": offset, "items": [], "error": str(e)}
+        return {"total": 0, "limit": limit, "offset": offset, "items": [], "error": "An internal error occurred."}
