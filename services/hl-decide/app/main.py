@@ -1040,14 +1040,22 @@ async def update_atr_for_consensus() -> None:
 
     Called on startup and periodically to refresh volatility data.
     Updates both the consensus detector and episode tracker with
-    current ATR-based stop distances.
+    current ATR-based stop distances, adjusted for market regime.
     """
+    from .regime import get_regime_detector, get_regime_adjusted_stop, MarketRegime
+
     try:
         atr_provider = get_atr_provider()
+        regime_detector = get_regime_detector(app.state.db)
 
         for symbol in ["BTC", "ETH"]:
             atr_data = await atr_provider.get_atr(symbol)
-            stop_fraction = atr_provider.get_stop_fraction(atr_data)
+            base_stop_fraction = atr_provider.get_stop_fraction(atr_data)
+
+            # Get current regime and adjust stop fraction
+            regime_analysis = await regime_detector.detect_regime(symbol)
+            regime = regime_analysis.regime if regime_analysis else MarketRegime.UNKNOWN
+            stop_fraction = get_regime_adjusted_stop(base_stop_fraction, regime)
 
             # Update ATR observability metrics
             atr_age_gauge.labels(asset=symbol).set(atr_data.age_seconds)
@@ -1072,7 +1080,8 @@ async def update_atr_for_consensus() -> None:
             # This affects new episodes; existing ones keep their original stop
             episode_config.default_stop_fraction = stop_fraction
 
-            print(f"[hl-decide] {symbol} ATR stop: {stop_fraction*100:.2f}% (source: {atr_data.source}, age: {atr_data.age_seconds:.0f}s)")
+            regime_str = regime.value if regime else "unknown"
+            print(f"[hl-decide] {symbol} ATR stop: {stop_fraction*100:.2f}% (base: {base_stop_fraction*100:.2f}%, regime: {regime_str}, source: {atr_data.source})")
 
     except Exception as e:
         print(f"[hl-decide] Failed to update ATR for consensus: {e}")

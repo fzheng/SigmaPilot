@@ -1299,3 +1299,183 @@ class TestQuantPipelineIntegration:
 
         # Decayed (lower) correlation → higher effK
         assert eff_k_decayed > eff_k_fresh
+
+
+class TestRegimeIntegration:
+    """Test regime detection integration with stops and Kelly sizing."""
+
+    def test_regime_adjusted_stop_trending(self):
+        """Trending regime should widen stops."""
+        from app.regime import get_regime_adjusted_stop, MarketRegime
+
+        base_stop = 0.02  # 2%
+        adjusted = get_regime_adjusted_stop(base_stop, MarketRegime.TRENDING)
+
+        # Trending: 1.2x multiplier
+        assert adjusted == pytest.approx(0.024, rel=0.01)
+
+    def test_regime_adjusted_stop_ranging(self):
+        """Ranging regime should tighten stops."""
+        from app.regime import get_regime_adjusted_stop, MarketRegime
+
+        base_stop = 0.02  # 2%
+        adjusted = get_regime_adjusted_stop(base_stop, MarketRegime.RANGING)
+
+        # Ranging: 0.8x multiplier
+        assert adjusted == pytest.approx(0.016, rel=0.01)
+
+    def test_regime_adjusted_stop_volatile(self):
+        """Volatile regime should widen stops significantly."""
+        from app.regime import get_regime_adjusted_stop, MarketRegime
+
+        base_stop = 0.02  # 2%
+        adjusted = get_regime_adjusted_stop(base_stop, MarketRegime.VOLATILE)
+
+        # Volatile: 1.5x multiplier
+        assert adjusted == pytest.approx(0.03, rel=0.01)
+
+    def test_regime_adjusted_kelly_trending(self):
+        """Trending regime should use full Kelly."""
+        from app.regime import get_regime_adjusted_kelly, MarketRegime
+
+        base_kelly = 0.25  # 25%
+        adjusted = get_regime_adjusted_kelly(base_kelly, MarketRegime.TRENDING)
+
+        # Trending: 1.0x multiplier
+        assert adjusted == pytest.approx(0.25, rel=0.01)
+
+    def test_regime_adjusted_kelly_volatile(self):
+        """Volatile regime should reduce Kelly."""
+        from app.regime import get_regime_adjusted_kelly, MarketRegime
+
+        base_kelly = 0.25  # 25%
+        adjusted = get_regime_adjusted_kelly(base_kelly, MarketRegime.VOLATILE)
+
+        # Volatile: 0.5x multiplier
+        assert adjusted == pytest.approx(0.125, rel=0.01)
+
+    def test_regime_adjusted_kelly_ranging(self):
+        """Ranging regime should slightly reduce Kelly."""
+        from app.regime import get_regime_adjusted_kelly, MarketRegime
+
+        base_kelly = 0.25  # 25%
+        adjusted = get_regime_adjusted_kelly(base_kelly, MarketRegime.RANGING)
+
+        # Ranging: 0.75x multiplier
+        assert adjusted == pytest.approx(0.1875, rel=0.01)
+
+
+class TestRiskGovernorIntegration:
+    """Test risk governor integration with execution."""
+
+    def test_kill_switch_blocks_execution(self):
+        """Kill switch should block all trades."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+        governor.trigger_kill_switch(reason="test kill switch")
+
+        result = governor.run_all_checks(
+            account_value=100000,
+            margin_used=10000,
+            maintenance_margin=5000,
+            total_exposure=0.1,
+            daily_pnl=0,
+        )
+
+        assert result.allowed is False
+        # Check for kill switch in reason
+        assert result.reason is not None
+        assert "kill" in result.reason.lower() or "halt" in result.reason.lower()
+
+    def test_liquidation_distance_blocks(self):
+        """Trades should be blocked when close to liquidation."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Margin ratio < 1.5x
+        result = governor.run_all_checks(
+            account_value=10000,
+            margin_used=9000,
+            maintenance_margin=8000,  # ratio = 10000/8000 = 1.25
+            total_exposure=0.5,
+            daily_pnl=0,
+        )
+
+        assert result.allowed is False
+        # Should have reason about margin or liquidation
+        assert result.reason is not None
+        assert "margin" in result.reason.lower() or "liquidation" in result.reason.lower()
+
+    def test_equity_floor_blocks(self):
+        """Trades should be blocked when below equity floor."""
+        from app.risk_governor import RiskGovernor, MIN_EQUITY_FLOOR
+
+        governor = RiskGovernor()
+
+        # Below minimum
+        result = governor.run_all_checks(
+            account_value=MIN_EQUITY_FLOOR - 1,
+            margin_used=0,
+            maintenance_margin=1,
+            total_exposure=0,
+            daily_pnl=0,
+        )
+
+        assert result.allowed is False
+        # Should have reason about account value or floor
+        assert result.reason is not None
+        assert "floor" in result.reason.lower() or "account" in result.reason.lower()
+
+
+class TestExecutorIntegration:
+    """Test executor integration with regime and risk governor."""
+
+    @pytest.mark.asyncio
+    async def test_executor_dry_run_by_default(self):
+        """Executor should default to dry run mode."""
+        from app.hl_exchange import REAL_EXECUTION_ENABLED
+
+        # By default, real execution should be disabled
+        assert REAL_EXECUTION_ENABLED is False
+
+    def test_kelly_result_includes_method(self):
+        """Kelly result should include the method used."""
+        from app.kelly import kelly_position_size, KellyInput
+
+        input_data = KellyInput(
+            win_rate=0.6,
+            avg_win_r=1.0,
+            avg_loss_r=0.5,
+            episode_count=50,
+            account_value=100000,
+            current_price=50000,
+            stop_distance_pct=0.02,
+        )
+
+        result = kelly_position_size(input_data)
+
+        assert result.method == "kelly"
+        assert result.position_pct > 0
+        assert result.reasoning is not None
+
+    def test_kelly_fallback_insufficient_data(self):
+        """Kelly should fall back when insufficient episodes."""
+        from app.kelly import kelly_position_size, KellyInput, KELLY_MIN_EPISODES
+
+        input_data = KellyInput(
+            win_rate=0.6,
+            avg_win_r=1.0,
+            avg_loss_r=0.5,
+            episode_count=KELLY_MIN_EPISODES - 1,  # Insufficient
+            account_value=100000,
+            current_price=50000,
+            stop_distance_pct=0.02,
+        )
+
+        result = kelly_position_size(input_data)
+
+        assert result.method == "fallback_insufficient_data"
+        # Reasoning mentions episode count needed
+        assert "episode" in result.reasoning.lower() or "need" in result.reasoning.lower()

@@ -233,6 +233,23 @@ class HyperliquidExecutor:
         if account_value <= 0:
             return False, "No account value", context
 
+        # Risk Governor hard limits check
+        try:
+            from .risk_governor import check_risk_from_account_state
+            account_state = await self.get_account_state()
+            if account_state:
+                risk_result = await check_risk_from_account_state(db, account_state)
+                if not risk_result.allowed:
+                    reasons = [w for w in risk_result.warnings if "blocked" in w.lower() or "exceeded" in w.lower()]
+                    reason_str = reasons[0] if reasons else "Risk governor blocked"
+                    context["risk_governor_warnings"] = risk_result.warnings
+                    return False, f"Risk governor: {reason_str}", context
+                # Store warnings for logging
+                if risk_result.warnings:
+                    context["risk_governor_warnings"] = risk_result.warnings
+        except Exception as e:
+            print(f"[executor] Risk governor check failed (allowing execution): {e}")
+
         # Check exposure limit
         current_exposure = await self.get_current_exposure()
         context["exposure_before"] = current_exposure
@@ -254,6 +271,19 @@ class HyperliquidExecutor:
         if kelly_enabled and consensus_addresses:
             # Use Kelly criterion sizing based on consensus traders
             kelly_fraction = config.get("kelly_fraction", KELLY_FRACTION)
+
+            # Adjust Kelly fraction for market regime
+            try:
+                from .regime import get_regime_detector, get_regime_adjusted_kelly, MarketRegime
+                regime_detector = get_regime_detector(db)
+                regime_analysis = await regime_detector.detect_regime(symbol)
+                regime = regime_analysis.regime if regime_analysis else MarketRegime.UNKNOWN
+                kelly_fraction = get_regime_adjusted_kelly(kelly_fraction, regime)
+                context["regime"] = regime.value if regime else "unknown"
+            except Exception as e:
+                print(f"[executor] Failed to get regime for Kelly adjustment: {e}")
+                context["regime"] = "unknown"
+
             kelly_result = await get_consensus_kelly_size(
                 db,
                 addresses=consensus_addresses,
@@ -301,8 +331,8 @@ class HyperliquidExecutor:
         """
         Execute a consensus signal.
 
-        For Phase 3e, this performs validation and logging only (dry run).
-        Phase 4 adds Kelly sizing and real execution.
+        By default, runs in dry-run mode (simulates execution).
+        When REAL_EXECUTION_ENABLED=true, places real orders via hl_exchange.
 
         Args:
             db: Database pool for logging
@@ -333,28 +363,97 @@ class HyperliquidExecutor:
             await self._log_execution(db, decision_id, symbol, direction, config, result)
             return result
 
-        # For Phase 3e: Dry run only
-        # In Phase 4, this would call the Hyperliquid SDK to place orders
+        # Check if real execution is enabled
+        from .hl_exchange import get_exchange, REAL_EXECUTION_ENABLED
 
+        if REAL_EXECUTION_ENABLED:
+            # REAL EXECUTION PATH
+            exchange = get_exchange()
+            if exchange.can_execute:
+                try:
+                    from .hl_exchange import execute_market_order
+                    is_buy = (direction == "long")
+                    size_coin = context.get("size_coin", 0)
+
+                    order_result = await execute_market_order(
+                        asset=symbol,
+                        is_buy=is_buy,
+                        size=size_coin,
+                    )
+
+                    if order_result.success:
+                        result = ExecutionResult(
+                            status="filled",
+                            fill_price=order_result.fill_price,
+                            fill_size=order_result.fill_size,
+                            exposure_before=context.get("exposure_before"),
+                            exposure_after=context.get("exposure_after"),
+                            position_pct=context.get("position_pct"),
+                            kelly_result=kelly_result,
+                        )
+
+                        # Register stop with StopManager
+                        try:
+                            from .stop_manager import get_stop_manager
+                            stop_manager = get_stop_manager(db)
+                            stop_pct = stop_distance_pct or 0.02
+                            await stop_manager.register_stop(
+                                decision_id=decision_id,
+                                symbol=symbol,
+                                direction=direction,
+                                entry_price=order_result.fill_price,
+                                entry_size=order_result.fill_size,
+                                stop_distance_pct=stop_pct,
+                            )
+                        except Exception as e:
+                            print(f"[executor] Failed to register stop: {e}")
+
+                        print(f"[executor] FILLED {direction} {symbol}: "
+                              f"size={order_result.fill_size:.4f} @ ${order_result.fill_price:,.2f}, "
+                              f"slippage={order_result.slippage_actual:.3f}%")
+                    else:
+                        result = ExecutionResult(
+                            status="failed",
+                            error_message=order_result.error,
+                            exposure_before=context.get("exposure_before"),
+                            kelly_result=kelly_result,
+                        )
+                        print(f"[executor] FAILED {direction} {symbol}: {order_result.error}")
+
+                    await self._log_execution(db, decision_id, symbol, direction, config, result)
+                    return result
+
+                except Exception as e:
+                    result = ExecutionResult(
+                        status="failed",
+                        error_message=f"Execution error: {str(e)}",
+                        exposure_before=context.get("exposure_before"),
+                        kelly_result=kelly_result,
+                    )
+                    await self._log_execution(db, decision_id, symbol, direction, config, result)
+                    return result
+
+        # DRY RUN PATH (default)
         result = ExecutionResult(
-            status="simulated",  # Would be "filled" with real execution
+            status="simulated",
             fill_price=context.get("price"),
             fill_size=context.get("size_coin"),
             exposure_before=context.get("exposure_before"),
             exposure_after=context.get("exposure_after"),
             position_pct=context.get("position_pct"),
-            error_message="Dry run - execution disabled",
+            error_message="Dry run - real execution disabled",
             kelly_result=kelly_result,
         )
 
         await self._log_execution(db, decision_id, symbol, direction, config, result)
 
         sizing_method = context.get("sizing_method", "fixed")
+        regime = context.get("regime", "unknown")
         print(f"[executor] Simulated {direction} {symbol}: "
               f"size={context.get('size_coin'):.4f}, "
               f"price=${context.get('price'):,.2f}, "
               f"exposure={context.get('exposure_before'):.1%} -> {context.get('exposure_after'):.1%}, "
-              f"sizing={sizing_method}")
+              f"sizing={sizing_method}, regime={regime}")
 
         return result
 

@@ -19,13 +19,14 @@ A collective intelligence trading system that learns from top Hyperliquid trader
 | 3d | Fill Sync & Auto-Refresh | ✅ Complete |
 | 3e | Decision Logging & Execution Foundation | ✅ Complete |
 | 3f | Selection Integrity (Shadow Ledger, FDR, Walk-Forward) | ✅ Complete |
-| 4 | Risk Management (Kelly criterion, stops, circuit breakers) | ✅ Complete |
-| 5 | Market Regime Detection | ✅ Complete |
+| 4 | Risk Management (Kelly criterion, stops, circuit breakers) | 🔶 Components Ready |
+| 5 | Market Regime Detection | 🔶 Components Ready |
+| 4-5 Integration | Wire regime/risk/execution together | 🔄 In Progress |
 | 6 | Multi-Exchange Integration | 🔲 Planned |
 
 ---
 
-## Current State: Phase 5 Complete
+## Current State: Phase 4-5 Integration In Progress
 
 ### What's Working
 
@@ -399,12 +400,17 @@ Verification steps are covered by the 71 unit tests in snapshot.py and walkforwa
 
 ---
 
-## Phase 4: Risk Management ✅
+## Phase 4: Risk Management 🔶
 
 ### Goal
 Implement Kelly criterion position sizing and real trade execution.
 
-### Status: Complete (December 2025)
+### Status: Components Ready, Integration Pending (December 2025)
+
+**Note**: All components are implemented and tested individually. Integration wiring is in progress to connect:
+- Regime detection → consensus thresholds, Kelly sizing, stop distances
+- Risk governor → signal generation, execution validation
+- Real execution path → hl_exchange with safety gates
 
 ### Foundation (Phase 3e)
 - ✅ Risk limit validation (max position, max exposure)
@@ -504,12 +510,14 @@ LOSS_STREAK_PAUSE_SECONDS=3600  # 1 hour pause
 
 ---
 
-## Phase 5: Market Regime Detection ✅
+## Phase 5: Market Regime Detection 🔶
 
 ### Goal
 Adapt strategy parameters based on market conditions.
 
-### Status: Complete (December 2025)
+### Status: Components Ready, Integration Pending (December 2025)
+
+**Note**: Regime detection is implemented with API endpoints but adjustment functions are not yet wired into the live consensus/execution pipeline.
 
 ### Regime Types
 | Regime | Detection | Response |
@@ -557,6 +565,48 @@ REGIME_CACHE_TTL_SECONDS=60      # Regime cache duration
 - [x] Add API endpoints for regime data
 - [x] Add dashboard regime card with live updates
 - [x] 39 unit tests covering all regime types
+
+---
+
+## Phase 4-5 Integration 🔄
+
+### Goal
+Wire together the Phase 4/5 components into the live signal/execution pipeline.
+
+### Status: In Progress
+
+### Integration Tasks
+
+#### 1. Regime → Consensus/Kelly/Stops
+- [ ] Call `get_regime_adjusted_stop()` in ATR gate before consensus check
+- [ ] Call `get_regime_adjusted_kelly()` in executor before position sizing
+- [ ] Call `get_regime_adjusted_confidence()` in risk limit check
+- [ ] Add regime to decision_logs for auditability
+
+#### 2. Risk Governor → Signal Generation & Execution
+- [ ] Import and call `RiskGovernor.run_all_checks()` in `handle_consensus_signal()`
+- [ ] Block signal if risk checks fail (log as `risk_rejected`)
+- [ ] Wire `check_risk_from_account_state()` into executor validation
+- [ ] Persist kill switch state across restarts
+
+#### 3. Real Execution Path
+- [ ] Add branch in `executor.execute_signal()` for `REAL_EXECUTION_ENABLED=true`
+- [ ] Call `hl_exchange.execute_market_order()` when enabled
+- [ ] Register stop with `StopManager` after execution
+- [ ] Update execution_logs with real fill data
+
+#### 4. Observability Metrics
+- [ ] Call `update_weight_metrics()` from consensus pipeline
+- [ ] Increment `effk_default_fallback_counter` when default ρ used
+- [ ] Add regime to signal metrics labels
+
+### Success Criteria
+| Criteria | Pass Condition |
+|----------|----------------|
+| Regime affects sizing | Kelly fraction varies by regime in execution logs |
+| Risk governor blocks | Signals rejected when risk limits exceeded |
+| Real execution works | Orders placed on testnet with `REAL_EXECUTION_ENABLED=true` |
+| Metrics emitted | Grafana shows weight_gini, effK values |
 
 ---
 
@@ -729,4 +779,4 @@ docker compose logs -f hl-decide
 
 ---
 
-*Last updated: December 12, 2025 (Phase 5 Complete, Phase 6 Next)*
+*Last updated: December 13, 2025 (Phase 4-5 Integration In Progress)*
