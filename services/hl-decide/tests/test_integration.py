@@ -1630,3 +1630,128 @@ class TestCircuitBreakerIntegration:
         result = governor.run_circuit_breaker_checks("BTC", has_existing_position=False)
 
         assert result.allowed is True
+
+
+class TestRiskGovernorProposedSize:
+    """Test risk governor with actual proposed size."""
+
+    def test_proposed_size_blocks_oversize_position(self):
+        """Large proposed size should be blocked by position size check."""
+        from app.risk_governor import RiskGovernor, MAX_POSITION_SIZE_PCT
+
+        governor = RiskGovernor()
+
+        # Account value $100k, max position 10% = $10k
+        # Propose a $15k trade - should be blocked
+        result = governor.run_all_checks(
+            account_value=100000,
+            margin_used=0,
+            maintenance_margin=1,
+            total_exposure=0,
+            daily_pnl=0,
+            proposed_size_usd=15000,  # 15% > 10% limit
+        )
+
+        assert result.allowed is False
+        assert "position" in result.reason.lower() or "size" in result.reason.lower()
+
+    def test_proposed_size_allows_valid_position(self):
+        """Valid proposed size should pass."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Account value $100k, max position 10% = $10k
+        # Propose a $5k trade - should pass
+        result = governor.run_all_checks(
+            account_value=100000,
+            margin_used=0,
+            maintenance_margin=1,
+            total_exposure=0,
+            daily_pnl=0,
+            proposed_size_usd=5000,  # 5% < 10% limit
+        )
+
+        assert result.allowed is True
+
+
+class TestCircuitBreakerPositionTracking:
+    """Test circuit breaker with actual position data."""
+
+    def test_position_count_from_account_state(self):
+        """Governor should track positions from account state."""
+        from app.risk_governor import RiskGovernor, MAX_CONCURRENT_POSITIONS
+
+        governor = RiskGovernor()
+
+        # Simulate updating position counts from account state
+        positions_by_symbol = {"BTC": 1, "ETH": 1, "SOL": 1}
+        governor._current_position_count = 3
+        governor._positions_by_symbol = positions_by_symbol
+
+        # Now check if we can open another position (depends on MAX_CONCURRENT_POSITIONS)
+        result = governor.run_circuit_breaker_checks("DOGE", has_existing_position=False)
+
+        # Default MAX_CONCURRENT_POSITIONS is 3, so this should be blocked
+        if MAX_CONCURRENT_POSITIONS == 3:
+            assert result.allowed is False
+            assert "concurrent" in result.reason.lower() or "position" in result.reason.lower()
+
+    def test_existing_symbol_position_blocked_when_limit_is_one(self):
+        """Adding to existing position should be blocked when MAX_POSITION_PER_SYMBOL=1."""
+        from app.risk_governor import RiskGovernor, MAX_POSITION_PER_SYMBOL
+
+        governor = RiskGovernor()
+
+        # Already have BTC position
+        governor._current_position_count = 1
+        governor._positions_by_symbol = {"BTC": 1}
+
+        # Adding to BTC position with has_existing_position=True
+        result = governor.run_circuit_breaker_checks("BTC", has_existing_position=True)
+
+        # When MAX_POSITION_PER_SYMBOL is 1, this should be blocked
+        if MAX_POSITION_PER_SYMBOL == 1:
+            assert result.allowed is False
+            assert "position" in result.reason.lower() or "BTC" in result.reason
+
+    def test_per_symbol_limit_blocks_new_position(self):
+        """Per-symbol position limit should block additional positions."""
+        from app.risk_governor import RiskGovernor, MAX_POSITION_PER_SYMBOL
+
+        governor = RiskGovernor()
+
+        # Already have max positions in BTC
+        governor._current_position_count = 1
+        governor._positions_by_symbol = {"BTC": MAX_POSITION_PER_SYMBOL}
+
+        # Adding another BTC position should be blocked
+        result = governor.run_circuit_breaker_checks("BTC", has_existing_position=True)
+
+        # If MAX_POSITION_PER_SYMBOL is 1, this should be blocked
+        if MAX_POSITION_PER_SYMBOL == 1:
+            assert result.allowed is False
+
+
+class TestMigrationVerification:
+    """Test that required migrations exist."""
+
+    def test_risk_daily_pnl_migration_exists(self):
+        """Verify 026_risk_governor_state.sql migration file exists with risk_daily_pnl table."""
+        import os
+
+        migration_path = os.path.join(
+            os.path.dirname(__file__),
+            "..", "..", "..", "db", "migrations", "026_risk_governor_state.sql"
+        )
+
+        # Check file exists
+        assert os.path.exists(migration_path), f"Migration file not found: {migration_path}"
+
+        # Check it contains risk_daily_pnl table definition
+        with open(migration_path, "r") as f:
+            content = f.read()
+
+        assert "risk_daily_pnl" in content, "Migration missing risk_daily_pnl table"
+        assert "starting_equity" in content, "Migration missing starting_equity column"
+        assert "daily_drawdown_pct" in content, "Migration missing daily_drawdown_pct column"

@@ -317,6 +317,49 @@ class HyperliquidExecutor:
         if new_exposure > max_exposure:
             return False, f"Trade would exceed exposure limit ({new_exposure:.1%} > {max_exposure:.1%})", context
 
+        # Re-run risk governor with actual proposed size
+        try:
+            from .risk_governor import check_risk_before_trade
+            account_state = await self.get_account_state()
+            if account_state:
+                risk_result = await check_risk_before_trade(db, account_state, proposed_size_usd=size_usd)
+                if not risk_result.allowed:
+                    reason_str = risk_result.reason or "Risk governor blocked (size check)"
+                    context["risk_governor_reason"] = reason_str
+                    context["risk_governor_warnings"] = risk_result.warnings
+                    return False, f"Risk governor: {reason_str}", context
+        except Exception as e:
+            print(f"[executor] Risk governor size check failed (allowing execution): {e}")
+
+        # Circuit breaker check (applies to both real and simulated execution)
+        try:
+            from .risk_governor import get_risk_governor
+            governor = get_risk_governor(db)
+
+            # Update position counts from account state before checking
+            account_state = context.get("account_state") or await self.get_account_state()
+            if account_state:
+                # Count current positions per symbol from account state
+                positions_by_symbol: dict[str, int] = {}
+                for ap in account_state.get("assetPositions", []):
+                    pos = ap.get("position", {})
+                    coin = pos.get("coin", "")
+                    size = float(pos.get("szi", 0))
+                    if size != 0 and coin:
+                        positions_by_symbol[coin] = positions_by_symbol.get(coin, 0) + 1
+
+                # Update governor with current position counts
+                governor._current_position_count = sum(positions_by_symbol.values())
+                governor._positions_by_symbol = positions_by_symbol
+
+            has_existing_position = symbol in governor._positions_by_symbol
+            cb_result = governor.run_circuit_breaker_checks(symbol, has_existing_position)
+            if not cb_result.allowed:
+                context["circuit_breaker_reason"] = cb_result.reason
+                return False, f"Circuit breaker: {cb_result.reason}", context
+        except Exception as e:
+            print(f"[executor] Circuit breaker check failed (allowing execution): {e}")
+
         return True, "Validation passed", context
 
     async def execute_signal(
@@ -369,27 +412,9 @@ class HyperliquidExecutor:
 
         if REAL_EXECUTION_ENABLED:
             # REAL EXECUTION PATH
+            # Note: Circuit breaker check already done in validate_execution()
             exchange = get_exchange()
             if exchange.can_execute:
-                # Circuit breaker check before real execution
-                try:
-                    from .risk_governor import get_risk_governor
-                    governor = get_risk_governor(db)
-                    # Check if we have existing position in this symbol
-                    has_position = await self.get_current_exposure() > 0
-                    cb_result = governor.run_circuit_breaker_checks(symbol, has_position)
-                    if not cb_result.allowed:
-                        result = ExecutionResult(
-                            status="rejected",
-                            error_message=f"Circuit breaker: {cb_result.reason}",
-                            exposure_before=context.get("exposure_before"),
-                            kelly_result=kelly_result,
-                        )
-                        await self._log_execution(db, decision_id, symbol, direction, config, result)
-                        return result
-                except Exception as e:
-                    print(f"[executor] Circuit breaker check failed (allowing execution): {e}")
-
                 try:
                     from .hl_exchange import execute_market_order
                     is_buy = (direction == "long")
