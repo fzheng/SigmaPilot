@@ -44,9 +44,9 @@ Leaderboard → Quality Filter → Alpha Pool → Thompson Sampling → Consensu
 | hl-decide | 4104 | Consensus detection, episode tracking |
 
 **Test Coverage:**
-- TypeScript: 973 unit tests
-- Python: 185 tests (hl-sage + hl-decide)
-- E2E: 110 Playwright tests (6 spec files)
+- TypeScript: 1,035 unit tests (28 test suites)
+- Python: 391 tests (150 hl-sage + 241 hl-decide)
+- E2E: 220 Playwright tests (6 spec files)
 
 ### Phase 3c Additions (December 2025)
 
@@ -505,13 +505,18 @@ Expand beyond Hyperliquid to support additional exchanges.
 |-----------|------|
 | NIG Model | `services/hl-sage/app/bandit.py` |
 | Thompson Sampling | `services/hl-sage/app/main.py` |
+| Shadow Ledger | `services/hl-sage/app/snapshot.py` |
+| Walk-Forward Replay | `services/hl-sage/app/walkforward.py` |
 | Consensus Detection | `services/hl-decide/app/consensus.py` |
 | ATR Provider | `services/hl-decide/app/atr.py` |
 | Correlation | `services/hl-decide/app/correlation.py` |
 | Episode Tracker | `services/hl-decide/app/episode.py` |
+| Decision Logger | `services/hl-decide/app/decision_logger.py` |
+| Risk Governor | `services/hl-decide/app/risk_governor.py` |
 | Portfolio Manager | `services/hl-decide/app/portfolio.py` |
 | Trade Executor | `services/hl-decide/app/executor.py` |
 | Dashboard | `services/hl-stream/public/dashboard.html` |
+| Init Script | `scripts/init-alpha-pool.mjs` |
 
 ---
 
@@ -627,4 +632,4 @@ docker compose logs -f hl-decide
 
 ---
 
-*Last updated: December 11, 2025 (Phase 3f Complete, Phase 4 Next)*
+*Last updated: December 12, 2025 (Phase 3f Complete, Phase 4 Next)*
