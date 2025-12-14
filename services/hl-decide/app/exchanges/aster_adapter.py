@@ -587,6 +587,35 @@ class AsterAdapter(ExchangeInterface):
         except Exception as e:
             return OrderResult(success=False, error=f"Take-profit failed: {str(e)}")
 
+    async def cancel_stop_orders(self, symbol: str) -> int:
+        """
+        Cancel all stop-loss and take-profit orders for a symbol.
+
+        Args:
+            symbol: Trading pair symbol
+
+        Returns:
+            Number of orders cancelled
+        """
+        try:
+            formatted_symbol = self.format_symbol(symbol)
+
+            result = await self._signed_request(
+                "POST",
+                "/v1/private/conditional-orders/cancel-all",
+                {"symbol": formatted_symbol},
+            )
+
+            if "error" in result:
+                print(f"[aster] Failed to cancel stop orders: {result['error']}")
+                return 0
+
+            return result.get("data", {}).get("cancelledCount", 0)
+
+        except Exception as e:
+            print(f"[aster] Failed to cancel stop orders: {e}")
+            return 0
+
     # Market data
 
     async def get_market_price(self, symbol: str) -> Optional[float]:

@@ -515,6 +515,65 @@ class ExchangeInterface(ABC):
         """
         pass
 
+    async def set_stop_loss_take_profit(
+        self,
+        symbol: str,
+        stop_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        size: Optional[float] = None,
+    ) -> tuple[OrderResult, OrderResult]:
+        """
+        Set both stop-loss and take-profit orders atomically.
+
+        Default implementation calls set_stop_loss and set_take_profit sequentially.
+        Exchanges with native bracket order support can override for atomicity.
+
+        Args:
+            symbol: Trading pair symbol
+            stop_price: Stop trigger price (None to skip)
+            take_profit_price: Take profit trigger price (None to skip)
+            size: Size to close (None = full position)
+
+        Returns:
+            Tuple of (stop_loss_result, take_profit_result)
+        """
+        sl_result = OrderResult(success=True, status="skipped")
+        tp_result = OrderResult(success=True, status="skipped")
+
+        if stop_price is not None:
+            sl_result = await self.set_stop_loss(symbol, stop_price, size)
+
+        if take_profit_price is not None:
+            tp_result = await self.set_take_profit(symbol, take_profit_price, size)
+
+        return (sl_result, tp_result)
+
+    @abstractmethod
+    async def cancel_stop_orders(
+        self,
+        symbol: str,
+    ) -> int:
+        """
+        Cancel all stop-loss and take-profit orders for a symbol.
+
+        Args:
+            symbol: Trading pair symbol
+
+        Returns:
+            Number of orders cancelled
+        """
+        pass
+
+    @property
+    def supports_native_stops(self) -> bool:
+        """
+        Check if exchange supports native stop orders.
+
+        Returns:
+            True if exchange supports native stop-loss and take-profit orders
+        """
+        return True  # Default to True since all adapters implement set_stop_loss/set_take_profit
+
     # Market data
 
     @abstractmethod

@@ -596,6 +596,39 @@ class HyperliquidAdapter(ExchangeInterface):
         except Exception as e:
             return OrderResult(success=False, error=f"Take-profit failed: {str(e)}")
 
+    async def cancel_stop_orders(self, symbol: str) -> int:
+        """
+        Cancel all stop-loss and take-profit orders for a symbol.
+
+        Hyperliquid trigger orders (tpsl orders) are cancelled via cancel.
+        """
+        if not self._exchange or not self._info:
+            return 0
+
+        account = self._get_account_address()
+        if not account:
+            return 0
+
+        try:
+            # Get open orders including trigger orders
+            open_orders = self._info.open_orders(account)
+            cancelled = 0
+
+            for order in open_orders:
+                order_symbol = order.get("coin", "")
+                order_type = order.get("orderType", "")
+
+                # Check if this is a trigger order (stop/tp) for the target symbol
+                if order_symbol == symbol and order_type in ("Stop Market", "Take Profit Market"):
+                    if await self.cancel_order(order_symbol, str(order.get("oid"))):
+                        cancelled += 1
+
+            return cancelled
+
+        except Exception as e:
+            print(f"[hyperliquid] Failed to cancel stop orders: {e}")
+            return 0
+
     # Market data
 
     async def get_market_price(self, symbol: str) -> Optional[float]:

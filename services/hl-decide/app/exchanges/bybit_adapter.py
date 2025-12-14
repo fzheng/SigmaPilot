@@ -761,6 +761,49 @@ class BybitAdapter(ExchangeInterface):
                 timestamp=datetime.now(timezone.utc),
             )
 
+    async def cancel_stop_orders(self, symbol: str) -> int:
+        """
+        Cancel all stop-loss and take-profit orders for a symbol.
+
+        Uses Bybit's set_trading_stop with 0 values to clear SL/TP.
+
+        Args:
+            symbol: Trading pair symbol
+
+        Returns:
+            Number of orders cancelled (0-2 for Bybit)
+        """
+        if not self._connected or not self._client:
+            return 0
+
+        try:
+            formatted_symbol = self.format_symbol(symbol)
+
+            # Bybit uses set_trading_stop with stopLoss=0 and takeProfit=0 to clear
+            response = await asyncio.to_thread(
+                self._client.set_trading_stop,
+                category=self.CATEGORY,
+                symbol=formatted_symbol,
+                stopLoss="0",
+                takeProfit="0",
+                positionIdx=0,
+            )
+
+            if response.get("retCode") == 0:
+                logger.info(f"Cancelled stop orders for {formatted_symbol}")
+                return 2  # Cleared both SL and TP
+
+            # 110020: No trading stop to cancel (position has no stops)
+            if response.get("retCode") == 110020:
+                return 0
+
+            logger.error(f"Failed to cancel stop orders: {response.get('retMsg')}")
+            return 0
+
+        except Exception as e:
+            logger.error(f"Error cancelling Bybit stop orders: {e}")
+            return 0
+
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """
         Get current market mid price.

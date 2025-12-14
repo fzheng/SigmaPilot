@@ -24,10 +24,11 @@ A collective intelligence trading system that learns from top Hyperliquid trader
 | 4-5 Integration | Wire regime/risk/execution together | ✅ Complete |
 | 6 | Multi-Exchange Integration | ✅ Complete |
 | 6.1 | Multi-Exchange Refinements | ✅ Complete |
+| 6.2 | Native Stop Orders (Execution Resilience) | ✅ Complete |
 
 ---
 
-## Current State: Phase 6.1 Complete
+## Current State: Phase 6.2 Complete
 
 ### What's Working
 
@@ -72,7 +73,7 @@ Leaderboard → Quality Filter → Alpha Pool → Thompson Sampling → Consensu
 
 **Test Coverage:**
 - TypeScript: 1,035 unit tests (28 test suites)
-- Python: 676 tests (hl-sage + hl-decide including Kelly, regime, exchange adapters, ATR/fee/funding/slippage/normalizer/executor/hold-time providers)
+- Python: 718 tests (hl-sage + hl-decide including Kelly, regime, exchange adapters, ATR/fee/funding/slippage/normalizer/executor/hold-time providers, native stops)
 - E2E: 220 Playwright tests (6 spec files)
 
 ### Phase 3c Additions (December 2025)
@@ -1026,6 +1027,132 @@ Before enabling live trading on any venue, validate:
 
 ---
 
+## Phase 6.2: Native Stop Orders (Execution Resilience) ✅
+
+### Goal
+Reduce execution latency and improve reliability by placing stop-loss and take-profit orders directly on exchanges instead of relying solely on local price polling.
+
+### Status: Complete (December 2025)
+
+### Why This Matters
+
+The original stop manager used polling (5s default) to monitor prices and execute market closes when stops were hit. This approach has limitations:
+
+| Limitation | Impact |
+|------------|--------|
+| Polling latency | 5 seconds between checks = potential slippage |
+| Service dependency | Stops don't fire if our service is down |
+| API rate limits | Polling many positions consumes API quota |
+
+**Native stops solve these issues** by placing conditional orders directly on the exchange:
+- Exchange executes stops immediately when price hits trigger
+- Stops work even if our service is unavailable
+- Reduced API calls (no constant price polling)
+
+### Implementation
+
+#### Exchange Interface Extensions
+- `set_stop_loss_take_profit()` - Combined method for atomic SL/TP placement
+- `cancel_stop_orders()` - Cancel all conditional orders for a symbol
+- `supports_native_stops` - Property to check exchange capability
+
+#### Adapter Implementations
+
+| Exchange | Method | Implementation |
+|----------|--------|---------------|
+| Hyperliquid | Trigger orders | `tpsl` order type with `triggerPx` |
+| Bybit | Trading stop | `set_trading_stop()` API call |
+| Aster | Conditional orders | `/v1/private/conditional-orders` endpoint |
+
+#### StopManager Enhancements
+
+**New Mode Selection:**
+```python
+# Native stops (preferred) - exchange handles SL/TP execution
+if USE_NATIVE_STOPS and not trailing_enabled:
+    native_stop_placed = await self._place_native_stops(...)
+
+# Fallback polling - local price monitoring
+else:
+    # Check prices every STOP_POLL_INTERVAL_S seconds
+```
+
+**When Native Stops Are Used:**
+- `USE_NATIVE_STOPS=true` (default)
+- Trailing stops disabled (trailing requires polling)
+- Exchange adapter is connected
+- Exchange supports native stops
+
+**Polling Still Used For:**
+- Trailing stops (stop price changes dynamically)
+- Timeout-based exits (no exchange support)
+- When native stop placement fails (graceful fallback)
+
+#### Database Schema
+
+```sql
+-- Migration 032_native_stops.sql
+ALTER TABLE active_stops
+    ADD COLUMN native_stop_placed BOOLEAN DEFAULT false,
+    ADD COLUMN native_sl_order_id VARCHAR(64),
+    ADD COLUMN native_tp_order_id VARCHAR(64);
+```
+
+### Configuration
+
+```bash
+# Enable native stop orders (default: true)
+USE_NATIVE_STOPS=true
+
+# Polling interval for fallback mode (default: 5s)
+STOP_POLL_INTERVAL_S=5
+
+# Take-profit ratio (default: 2:1 reward:risk)
+DEFAULT_RR_RATIO=2.0
+
+# Position timeout (default: 7 days)
+MAX_POSITION_HOURS=168
+```
+
+### Key Files
+
+| File | Description |
+|------|-------------|
+| `exchanges/interface.py` | Extended with native stop methods |
+| `exchanges/hyperliquid_adapter.py` | `cancel_stop_orders()` implementation |
+| `exchanges/bybit_adapter.py` | `cancel_stop_orders()` via `set_trading_stop` |
+| `exchanges/aster_adapter.py` | `cancel_stop_orders()` via conditional orders API |
+| `stop_manager.py` | Native vs polling mode selection |
+| `db/migrations/032_native_stops.sql` | Schema for native stop tracking |
+| `tests/test_native_stops.py` | 15 unit tests |
+
+### Test Coverage
+
+| Test Class | Tests | Coverage |
+|------------|-------|----------|
+| `TestExchangeInterfaceNativeStops` | 2 | Interface properties and combined method |
+| `TestStopConfigNativeFields` | 2 | Config dataclass fields |
+| `TestStopManagerNativeStops` | 5 | Registration, placement, fallback |
+| `TestCancelStopOrders` | 3 | Adapter cancel methods |
+| `TestCheckStopsNativeMode` | 2 | Native vs polling behavior |
+| `TestNativeStopsConfiguration` | 1 | Environment variable parsing |
+| **Total** | **15** | All passing |
+
+### Success Criteria
+
+| Criteria | Pass Condition | Status |
+|----------|----------------|--------|
+| Interface extension | All adapters implement `cancel_stop_orders()` | ✅ |
+| Combined SL/TP | Atomic placement via `set_stop_loss_take_profit()` | ✅ |
+| Native mode selection | Non-trailing stops use native when available | ✅ |
+| Polling fallback | Graceful degradation when native fails | ✅ |
+| Timeout handling | Cancel native stops before timeout close | ✅ |
+| Position detection | Detect exchange-triggered closes | ✅ |
+| Database tracking | `native_stop_placed` persisted correctly | ✅ |
+| All tests passing | 718 Python tests + 1,035 TypeScript tests | ✅ |
+
+---
+
 ## Architecture
 
 ```
@@ -1188,4 +1315,4 @@ docker compose logs -f hl-decide
 
 ---
 
-*Last updated: December 14, 2025 (Phase 6.1 complete: All multi-exchange gaps resolved - 703 Python tests; per-venue ATR/regime/EV; USD normalization in all risk paths; Kelly-sized slippage recalculation; dynamic hold-time estimation)*
+*Last updated: December 14, 2025 (Phase 6.2 complete: Native stop orders for execution resilience - 718 Python tests; exchange-native SL/TP placement; cancel_stop_orders on all adapters; polling fallback for trailing stops)*

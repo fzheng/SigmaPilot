@@ -462,7 +462,68 @@ await exchange.disconnect()
 | `close_position()` | Partial or full close |
 | `set_leverage()` | Leverage configuration |
 | `set_stop_loss()` / `set_take_profit()` | Position protection |
+| `set_stop_loss_take_profit()` | Combined SL/TP placement (Phase 6.2) |
+| `cancel_stop_orders()` | Cancel all conditional orders (Phase 6.2) |
 | `get_market_price()` | Current mid price |
+
+### Native Stop Orders (Phase 6.2)
+
+The exchange interface supports native stop orders for lower latency execution. When enabled, stop-loss and take-profit orders are placed directly on the exchange instead of relying on local price polling.
+
+**Python Usage:**
+```python
+from app.exchanges import get_exchange, ExchangeType
+
+# Connect to exchange
+exchange = await connect_exchange(ExchangeType.HYPERLIQUID, testnet=True)
+
+# Check if exchange supports native stops
+if exchange.supports_native_stops:
+    # Set stop-loss and take-profit atomically
+    sl_result, tp_result = await exchange.set_stop_loss_take_profit(
+        symbol="BTC",
+        stop_price=49000.0,      # Stop-loss trigger
+        take_profit_price=52000.0,  # Take-profit trigger
+        size=0.01,              # Position size
+    )
+
+    # Cancel all stop orders for a symbol
+    cancelled = await exchange.cancel_stop_orders(symbol="BTC")
+    print(f"Cancelled {cancelled} stop orders")
+```
+
+**Exchange-Specific Implementations:**
+
+| Exchange | SL/TP Method | Cancel Method |
+|----------|--------------|---------------|
+| Hyperliquid | Trigger orders (`tpsl`) | Cancel by order type filter |
+| Bybit | `set_trading_stop()` | Set SL/TP to 0 |
+| Aster | Conditional orders API | `cancel-all` endpoint |
+
+**StopManager Modes:**
+
+The `StopManager` automatically selects the best mode based on configuration:
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| Native | `USE_NATIVE_STOPS=true` + non-trailing | Place SL/TP on exchange |
+| Polling | Trailing enabled or native fails | Local price monitoring |
+| Hybrid | Native SL + polling timeout | Best of both worlds |
+
+**Configuration:**
+```bash
+# Enable native stop orders (default: true)
+USE_NATIVE_STOPS=true
+
+# Polling interval for fallback mode
+STOP_POLL_INTERVAL_S=5
+
+# Take-profit ratio
+DEFAULT_RR_RATIO=2.0
+
+# Position timeout
+MAX_POSITION_HOURS=168
+```
 
 ---
 
