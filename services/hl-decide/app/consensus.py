@@ -465,6 +465,12 @@ class ConsensusSignal:
     # Metadata
     created_at: datetime
     trigger_addresses: List[str]
+    # Execution venue (Phase 6.3)
+    target_exchange: str = "hyperliquid"  # Best exchange selected by EV comparison
+    # Cost breakdown (Phase 6.3)
+    fees_bps: float = 0.0
+    slippage_bps: float = 0.0
+    funding_bps: float = 0.0
 
 
 class ConsensusDetector:

@@ -1974,20 +1974,32 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
         )
         return None
 
-    # Gate 4: EV after costs
+    # Gate 4: EV after costs (Phase 6.3: per-venue comparison)
     p_win = consensus_detector.calibrated_p_win(agreeing_votes, eff_k)
-    ev_result = calculate_ev(
+
+    # Compare EV across available exchanges to find best execution venue
+    ev_comparison = consensus_detector.compare_ev_across_exchanges(
+        asset=asset,
+        direction=majority_dir,
+        entry_price=median_entry,
+        stop_price=stop_price,
         p_win=p_win,
-        entry_px=median_entry,
-        stop_px=stop_price,
+        exchanges=["hyperliquid", "bybit"],  # Available execution venues
     )
 
-    ev_passed = ev_result["ev_net_r"] >= CONSENSUS_EV_MIN_R
+    # Get best exchange and its EV
+    best_exchange = ev_comparison.get("best_exchange", "hyperliquid")
+    best_ev_net_r = ev_comparison.get("best_ev_net_r", 0.0)
+    best_ev_result = ev_comparison.get(best_exchange, {})
+
+    # Use best venue's EV for the gate
+    ev_passed = best_ev_net_r >= CONSENSUS_EV_MIN_R
     gate_results.append(GateResult(
         name="ev_gate",
         passed=ev_passed,
-        value=ev_result["ev_net_r"],
+        value=best_ev_net_r,
         threshold=CONSENSUS_EV_MIN_R,
+        detail=f"best_venue={best_exchange}",
     ))
 
     if not ev_passed:
@@ -2002,11 +2014,11 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
             gates=gate_results,
             price=mid_price,
             confidence=p_win,
-            ev=ev_result["ev_net_r"],
+            ev=best_ev_net_r,
         )
         return None
 
-    # All consensus gates passed! Create signal
+    # All consensus gates passed! Create signal with selected venue
     latency_ms = int((now - oldest_ts).total_seconds() * 1000)
     mid_delta_bps = abs(mid_price - median_entry) / median_entry * 10000 if median_entry > 0 else 0
 
@@ -2025,14 +2037,19 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
         eff_k=eff_k,
         dispersion=dispersion,
         p_win=p_win,
-        ev_gross_r=ev_result["ev_gross_r"],
-        ev_cost_r=ev_result["ev_cost_r"],
-        ev_net_r=ev_result["ev_net_r"],
+        ev_gross_r=best_ev_result.get("ev_gross_r", 0.0),
+        ev_cost_r=best_ev_result.get("ev_cost_r", 0.0),
+        ev_net_r=best_ev_net_r,
         latency_ms=latency_ms,
         median_voter_price=median_entry,
         mid_delta_bps=mid_delta_bps,
         created_at=now,
         trigger_addresses=[v.address for v in agreeing_votes],
+        # Phase 6.3: Execution venue and cost breakdown
+        target_exchange=best_exchange,
+        fees_bps=best_ev_result.get("fees_bps", 0.0),
+        slippage_bps=best_ev_result.get("slippage_bps", 0.0),
+        funding_bps=best_ev_result.get("funding_bps", 0.0),
     )
 
     # Gate 5: Risk limits fail-safe (regime-aware)
@@ -2075,7 +2092,7 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
             risk_checks=[{"name": "risk_limits", "passed": False, "reason": risk_reason}],
             price=mid_price,
             confidence=p_win,
-            ev=ev_result["ev_net_r"],
+            ev=best_ev_net_r,
         )
         return None
 
@@ -2093,16 +2110,17 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
         gates=gate_results,
         price=mid_price,
         confidence=p_win,
-        ev=ev_result["ev_net_r"],
+        ev=best_ev_net_r,
     )
 
-    # Attempt execution if auto-trading is enabled
+    # Attempt execution if auto-trading is enabled (Phase 6.3: use signal's target exchange)
     from .executor import maybe_execute_signal
     await maybe_execute_signal(
         db=app.state.db,
         decision_id=decision_id,
         symbol=asset,
         direction=majority_dir,
+        target_exchange=signal.target_exchange,  # Phase 6.3: route to best venue
     )
 
     return signal
@@ -2123,7 +2141,7 @@ async def handle_consensus_signal(signal: ConsensusSignal) -> None:
         # Log signal
         print(f"[hl-decide] CONSENSUS SIGNAL: {signal.direction} {signal.symbol} "
               f"@ {signal.entry_price:.2f}, effK={signal.eff_k:.2f}, EV={signal.ev_net_r:.3f}R, "
-              f"traders={signal.n_agreeing}/{signal.n_traders}")
+              f"traders={signal.n_agreeing}/{signal.n_traders}, venue={signal.target_exchange}")
 
         # Build signal payload for NATS
         signal_payload = {
@@ -2145,6 +2163,11 @@ async def handle_consensus_signal(signal: ConsensusSignal) -> None:
             "mid_delta_bps": signal.mid_delta_bps,
             "created_at": signal.created_at.isoformat(),
             "trigger_addresses": signal.trigger_addresses,
+            # Phase 6.3: Execution venue and cost breakdown
+            "target_exchange": signal.target_exchange,
+            "fees_bps": signal.fees_bps,
+            "slippage_bps": signal.slippage_bps,
+            "funding_bps": signal.funding_bps,
         }
 
         # Publish to NATS
@@ -2162,10 +2185,12 @@ async def handle_consensus_signal(signal: ConsensusSignal) -> None:
                     n_traders, n_agreeing, eff_k, dispersion,
                     p_win, ev_gross_r, ev_cost_r, ev_net_r,
                     latency_ms, median_voter_price, mid_delta_bps,
-                    trigger_addresses, created_at
+                    trigger_addresses, created_at,
+                    target_exchange, fees_bps, slippage_bps, funding_bps
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16, $17, $18
+                    $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                    $19, $20, $21, $22
                 )
                 ON CONFLICT (id) DO NOTHING
                 """,
@@ -2187,6 +2212,11 @@ async def handle_consensus_signal(signal: ConsensusSignal) -> None:
                 signal.mid_delta_bps,
                 signal.trigger_addresses,
                 signal.created_at,
+                # Phase 6.3: Venue and cost breakdown
+                signal.target_exchange,
+                signal.fees_bps,
+                signal.slippage_bps,
+                signal.funding_bps,
             )
 
     except Exception as e:

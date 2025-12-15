@@ -25,10 +25,11 @@ A collective intelligence trading system that learns from top Hyperliquid trader
 | 6 | Multi-Exchange Integration | ✅ Complete |
 | 6.1 | Multi-Exchange Refinements | ✅ Complete |
 | 6.2 | Native Stop Orders (Execution Resilience) | ✅ Complete |
+| 6.3 | Per-Venue EV Routing | ✅ Complete |
 
 ---
 
-## Current State: Phase 6.2 Complete
+## Current State: Phase 6.3 Complete
 
 ### What's Working
 
@@ -1153,6 +1154,125 @@ MAX_POSITION_HOURS=168
 
 ---
 
+## Phase 6.3: Per-Venue EV Routing ✅
+
+### Goal
+Enable consensus detection to compare EV across multiple execution venues and route signals to the best exchange based on net expected value.
+
+### Status: Complete (December 2025)
+
+### Why This Matters
+
+The original EV calculation used a single global target exchange for all signals. This approach has limitations:
+
+| Limitation | Impact |
+|------------|--------|
+| Global target exchange | Same fees/slippage/funding used regardless of venue |
+| No venue comparison | Cannot identify better execution venues |
+| Missed edge | Venue A may have +0.3R while venue B has +0.4R |
+
+**Per-venue EV routing solves these issues** by:
+- Calculating EV for each available exchange using venue-specific costs
+- Comparing net EV across venues to find optimal execution
+- Routing signals to the best exchange automatically
+
+### Implementation
+
+#### ConsensusSignal Extensions
+```python
+@dataclass
+class ConsensusSignal:
+    # ... existing fields ...
+    # Execution venue (Phase 6.3)
+    target_exchange: str = "hyperliquid"  # Best exchange selected by EV comparison
+    # Cost breakdown (Phase 6.3)
+    fees_bps: float = 0.0
+    slippage_bps: float = 0.0
+    funding_bps: float = 0.0
+```
+
+#### Multi-Venue EV Comparison
+```python
+# In consensus gate, compare EV across venues
+ev_comparison = consensus_detector.compare_ev_across_exchanges(
+    asset=asset,
+    direction=majority_dir,
+    entry_price=median_entry,
+    stop_price=stop_price,
+    p_win=p_win,
+    exchanges=["hyperliquid", "bybit"],  # Available execution venues
+)
+
+# Select best exchange by highest net EV
+best_exchange = ev_comparison.get("best_exchange", "hyperliquid")
+best_ev_net_r = ev_comparison.get("best_ev_net_r", 0.0)
+```
+
+#### Executor Venue Routing
+```python
+async def maybe_execute_signal(
+    db: asyncpg.Pool,
+    decision_id: str,
+    symbol: str,
+    direction: str,
+    target_exchange: Optional[str] = None,  # Phase 6.3: per-signal venue routing
+    ...
+) -> Optional[ExecutionResult]:
+    # Use signal's target exchange if provided
+    if target_exchange:
+        config["exchange"] = target_exchange
+```
+
+### Database Schema
+
+```sql
+-- Migration 033_consensus_signal_venue.sql
+ALTER TABLE consensus_signals
+    ADD COLUMN IF NOT EXISTS target_exchange VARCHAR(16) DEFAULT 'hyperliquid';
+ALTER TABLE consensus_signals
+    ADD COLUMN IF NOT EXISTS fees_bps DECIMAL(10,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS slippage_bps DECIMAL(10,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS funding_bps DECIMAL(10,4) DEFAULT 0;
+```
+
+### Key Files
+
+| File | Description |
+|------|-------------|
+| `app/consensus.py` | ConsensusSignal with venue fields, `compare_ev_across_exchanges()` |
+| `app/main.py` | Consensus gate wired to use multi-venue EV comparison |
+| `app/executor.py` | `target_exchange` parameter for venue routing |
+| `db/migrations/033_consensus_signal_venue.sql` | Schema for venue tracking |
+| `tests/test_ev_per_venue.py` | 26 unit tests |
+
+### Test Coverage
+
+| Test Class | Tests | Coverage |
+|------------|-------|----------|
+| `TestCalculateEVForExchange` | 6 | Per-exchange EV calculation |
+| `TestCompareEVAcrossExchanges` | 4 | Multi-venue comparison |
+| `TestExchangeFeeLookup` | 3 | Fee lookup by exchange |
+| `TestEVGateIntegration` | 2 | Target exchange affects EV |
+| `TestCostBreakdown` | 2 | Cost component breakdown |
+| `TestConsensusSignalVenueRouting` | 5 | Signal venue routing fields |
+| `TestPhase63Integration` | 4 | Integration tests |
+| **Total** | **26** | All passing |
+
+### Success Criteria
+
+| Criteria | Pass Condition | Status |
+|----------|----------------|--------|
+| Per-venue EV calculation | `calculate_ev_for_exchange()` returns venue-specific EV | ✅ |
+| Multi-venue comparison | `compare_ev_across_exchanges()` finds best venue | ✅ |
+| Best exchange selection | Highest net EV wins | ✅ |
+| Signal carries venue | `ConsensusSignal.target_exchange` populated | ✅ |
+| Cost breakdown tracked | fees_bps, slippage_bps, funding_bps in signal | ✅ |
+| Executor routes correctly | `target_exchange` used in execution config | ✅ |
+| Database persistence | Venue data saved to `consensus_signals` table | ✅ |
+| All tests passing | 26 Phase 6.3 tests passing | ✅ |
+
+---
+
 ## Architecture
 
 ```
@@ -1315,4 +1435,4 @@ docker compose logs -f hl-decide
 
 ---
 
-*Last updated: December 14, 2025 (Phase 6.2 complete: Native stop orders for execution resilience - 718 Python tests; exchange-native SL/TP placement; cancel_stop_orders on all adapters; polling fallback for trailing stops)*
+*Last updated: December 14, 2025 (Phase 6.3 complete: Per-venue EV routing - 26 new tests; consensus compares EV across exchanges; signals route to best venue; cost breakdown tracked in ConsensusSignal)*

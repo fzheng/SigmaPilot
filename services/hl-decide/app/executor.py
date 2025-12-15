@@ -993,6 +993,7 @@ async def maybe_execute_signal(
     direction: str,
     consensus_addresses: Optional[list[str]] = None,
     stop_distance_pct: float = 0.02,
+    target_exchange: Optional[str] = None,  # Phase 6.3: per-signal venue routing
 ) -> Optional[ExecutionResult]:
     """
     Execute a signal if auto-trading is enabled.
@@ -1007,6 +1008,7 @@ async def maybe_execute_signal(
         direction: Trade direction (long, short)
         consensus_addresses: List of trader addresses in consensus (for Kelly sizing)
         stop_distance_pct: Stop distance as fraction (for Kelly sizing)
+        target_exchange: Target exchange for execution (Phase 6.3: from EV comparison)
 
     Returns:
         ExecutionResult if execution was attempted, None if disabled
@@ -1018,6 +1020,10 @@ async def maybe_execute_signal(
 
     if not config.get("configured") or not config.get("enabled"):
         return None  # Auto-trading disabled
+
+    # Phase 6.3: Use signal's target exchange if provided, else fall back to config
+    if target_exchange:
+        config["exchange"] = target_exchange
 
     # Execute with Kelly sizing if enabled
     executor = get_executor()
