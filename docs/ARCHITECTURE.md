@@ -157,7 +157,7 @@ Key configuration (see `.env.example`):
 ## Testing
 
 - **TypeScript**: Jest (1,035 tests)
-- **Python**: pytest (348 tests)
+- **Python**: pytest (765+ tests)
 - **E2E**: Playwright (220 tests)
 - **Coverage**: ~76% overall, ~89% for ts-lib
 

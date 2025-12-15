@@ -36,7 +36,13 @@ from starlette.responses import Response
 from pydantic import BaseModel
 
 from contracts.py.models import FillEvent, ScoreEvent
-from .consensus import ConsensusDetector, Fill, ConsensusSignal
+from .consensus import (
+    ConsensusDetector,
+    Fill,
+    ConsensusSignal,
+    PER_SIGNAL_VENUE_SELECTION,
+    VENUE_SELECTION_EXCHANGES,
+)
 from .episode import EpisodeTracker, EpisodeFill, Episode, EpisodeBuilderConfig
 from .atr import get_atr_provider, init_atr_provider, ATRProvider
 from .atr_provider import (
@@ -1977,14 +1983,14 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
     # Gate 4: EV after costs (Phase 6.3: per-venue comparison)
     p_win = consensus_detector.calibrated_p_win(agreeing_votes, eff_k)
 
-    # Compare EV across available exchanges to find best execution venue
+    # Compare EV across available exchanges to find best execution venue (Phase 6.5)
     ev_comparison = consensus_detector.compare_ev_across_exchanges(
         asset=asset,
         direction=majority_dir,
         entry_price=median_entry,
         stop_price=stop_price,
         p_win=p_win,
-        exchanges=["hyperliquid", "bybit"],  # Available execution venues
+        exchanges=VENUE_SELECTION_EXCHANGES if PER_SIGNAL_VENUE_SELECTION else [consensus_detector.target_exchange],
     )
 
     # Get best exchange and its EV

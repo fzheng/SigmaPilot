@@ -33,6 +33,18 @@ from .factory import create_exchange, get_exchange
 
 logger = logging.getLogger(__name__)
 
+# Per-venue rate limit configuration (Phase 6.4)
+# Delay in ms between API calls for each exchange
+# Some exchanges have stricter rate limits
+EXCHANGE_RATE_LIMIT_DELAYS_MS = {
+    "hyperliquid": 300,   # HL is relatively lenient
+    "aster": 500,         # Similar to HL
+    "bybit": 750,         # Bybit has stricter limits (10 req/s public, 20 req/s private)
+}
+
+# Default delay if exchange not configured
+DEFAULT_RATE_LIMIT_DELAY_MS = int(os.getenv("EXCHANGE_RATE_LIMIT_DELAY_MS", "500"))
+
 
 @dataclass
 class AggregatedBalance:
@@ -40,7 +52,7 @@ class AggregatedBalance:
     Balance aggregated across all connected exchanges.
 
     All values are USD-normalized (Phase 6.1).
-    USDT balances are converted to USD using AccountNormalizer.
+    USDT is treated as 1:1 with USD (no conversion API calls needed).
     """
     total_equity: float  # USD-normalized
     available_balance: float  # USD-normalized
@@ -224,7 +236,7 @@ class ExchangeManager:
         Get aggregated balance across all connected exchanges.
 
         All values are USD-normalized (Phase 6.1).
-        USDT balances from Bybit are converted to USD using AccountNormalizer.
+        USDT is treated as 1:1 with USD (no API calls needed).
 
         Returns:
             AggregatedBalance with USD-normalized totals and per-exchange breakdown
@@ -752,7 +764,7 @@ class ExchangeManager:
     async def health_check(
         self,
         testnet: bool = True,
-        stagger_delay_ms: int = 500,
+        stagger_delay_ms: Optional[int] = None,
     ) -> dict[str, Any]:
         """
         Check health of all exchanges and attempt reconnection if needed.
@@ -760,12 +772,12 @@ class ExchangeManager:
         Probes each connected exchange by fetching balance/positions.
         If an exchange fails the probe, attempts to reconnect.
 
-        Rate limiting: Adds a configurable delay between probing each exchange
-        to prevent hitting API rate limits when multiple exchanges are configured.
+        Phase 6.4: Uses per-exchange rate limit delays from EXCHANGE_RATE_LIMIT_DELAYS_MS.
+        Different exchanges have different rate limits, so we respect them individually.
 
         Args:
             testnet: Whether using testnet (for reconnection attempts)
-            stagger_delay_ms: Delay in ms between checking each exchange (default 500ms)
+            stagger_delay_ms: Override delay between exchanges (None = use per-exchange config)
 
         Returns:
             Dict with health status per exchange:
@@ -783,9 +795,19 @@ class ExchangeManager:
 
         exchange_list = list(self._exchanges.items())
         for i, (ex_type, exchange) in enumerate(exchange_list):
+            # Phase 6.4: Per-exchange rate limiting
+            # Get delay for this specific exchange, or use override/default
+            if stagger_delay_ms is not None:
+                delay_ms = stagger_delay_ms
+            else:
+                delay_ms = EXCHANGE_RATE_LIMIT_DELAYS_MS.get(
+                    ex_type.value.lower(),
+                    DEFAULT_RATE_LIMIT_DELAY_MS,
+                )
+
             # Rate limiting: add delay between exchanges (except first)
-            if i > 0 and stagger_delay_ms > 0:
-                await asyncio.sleep(stagger_delay_ms / 1000)
+            if i > 0 and delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000)
             status = {
                 "connected": exchange.is_connected,
                 "healthy": False,

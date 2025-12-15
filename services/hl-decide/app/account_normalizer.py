@@ -5,55 +5,22 @@ Normalizes account balances and positions across different exchanges
 to a common USD denomination for consistent risk calculations.
 
 Key functionality:
-- USDT/USD conversion with rate caching
-- Normalize Balance objects to USD
-- Normalize Position notional values to USD
+- Treats USDT as equivalent to USD (1:1) - no API calls needed
+- Normalize Balance objects
+- Normalize Position notional values
 - Unified exposure calculation across venues
+
+Note: USDT is a stablecoin pegged 1:1 to USD. Tracking tiny depegs
+(e.g., 0.9998) adds complexity without meaningful value for position
+sizing or risk calculations.
 
 @module account_normalizer
 """
 
-import os
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 from typing import Optional, Dict
 
-import httpx
-
 from app.exchanges.interface import Balance, Position
-
-
-# Configuration
-USDT_RATE_CACHE_TTL_SECONDS = int(os.getenv("USDT_RATE_CACHE_TTL_SECONDS", "60"))
-USDT_RATE_API_TIMEOUT = int(os.getenv("USDT_RATE_API_TIMEOUT", "3"))
-
-# API for USDT/USD rate (CoinGecko public API, no key required)
-COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
-
-# Fallback rate when API unavailable (USDT typically trades within 0.1% of $1.00)
-DEFAULT_USDT_USD_RATE = float(os.getenv("DEFAULT_USDT_USD_RATE", "1.0"))
-
-# Warning threshold for stablecoin depeg (0.5% = 0.005)
-DEPEG_WARNING_THRESHOLD = float(os.getenv("DEPEG_WARNING_THRESHOLD", "0.005"))
-
-
-@dataclass
-class CurrencyRate:
-    """Cached currency conversion rate."""
-    rate: float  # Rate to convert to USD (e.g., USDT -> USD)
-    source: str  # 'api', 'fallback', or 'assumed'
-    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-    @property
-    def is_expired(self) -> bool:
-        """Check if rate has expired."""
-        age = (datetime.now(timezone.utc) - self.fetched_at).total_seconds()
-        return age > USDT_RATE_CACHE_TTL_SECONDS
-
-    @property
-    def age_seconds(self) -> float:
-        """Get age of rate in seconds."""
-        return (datetime.now(timezone.utc) - self.fetched_at).total_seconds()
 
 
 @dataclass
@@ -61,21 +28,23 @@ class NormalizedBalance:
     """
     Account balance normalized to USD.
 
-    Wraps original Balance with USD-normalized values for consistent
+    Wraps original Balance with USD-equivalent values for consistent
     risk calculations across exchanges with different quote currencies.
+
+    Note: USDT is treated as 1:1 with USD (no conversion needed).
     """
     original: Balance
 
-    # USD-normalized values
+    # USD-equivalent values
     total_equity_usd: float
     available_balance_usd: float
     margin_used_usd: float
     unrealized_pnl_usd: float
     realized_pnl_today_usd: float
 
-    # Conversion info
-    conversion_rate: float  # Rate used for conversion
-    conversion_source: str  # 'api', 'fallback', 'identity' (for USD)
+    # Conversion info (for API compatibility)
+    conversion_rate: float = 1.0  # Always 1.0 (USDT = USD)
+    conversion_source: str = "identity"  # Always identity
 
     @property
     def margin_ratio(self) -> float:
@@ -86,164 +55,71 @@ class NormalizedBalance:
 
     @property
     def is_depeg_warning(self) -> bool:
-        """Check if conversion rate indicates potential stablecoin depeg."""
-        if self.conversion_source == "identity":
-            return False
-        return abs(self.conversion_rate - 1.0) > DEPEG_WARNING_THRESHOLD
+        """Always False - we treat USDT as USD."""
+        return False
 
 
 @dataclass
 class NormalizedPosition:
     """
-    Position with USD-normalized notional value.
+    Position with USD-equivalent notional value.
 
     Useful when aggregating exposure across venues with different
-    quote currencies.
+    quote currencies. USDT is treated as USD (1:1).
     """
     original: Position
     notional_value_usd: float
-    conversion_rate: float
-    conversion_source: str
+    conversion_rate: float = 1.0
+    conversion_source: str = "identity"
 
 
 class AccountNormalizer:
     """
     Multi-exchange account state normalizer.
 
-    Converts all account balances and position values to USD for
-    consistent risk calculations regardless of venue quote currency.
+    Treats all stablecoin balances (USD, USDT) as equivalent for
+    risk calculations. No external API calls needed.
 
     Supported currencies:
-    - USD (no conversion needed)
-    - USDT (fetches rate from CoinGecko, fallback to 1.0)
+    - USD (identity)
+    - USDT (treated as USD, 1:1)
 
     Usage:
         normalizer = AccountNormalizer()
 
         # Normalize Bybit balance (USDT)
         bybit_balance = await bybit.get_balance()  # currency="USDT"
-        normalized = await normalizer.normalize_balance(bybit_balance)
+        normalized = normalizer.normalize_balance_sync(bybit_balance)
 
-        # Access USD values
+        # Access USD-equivalent values
         print(f"Equity: ${normalized.total_equity_usd:.2f}")
     """
 
     def __init__(self):
         """Initialize account normalizer."""
-        self._rate_cache: Dict[str, CurrencyRate] = {}
-        self._client: Optional[httpx.AsyncClient] = None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=USDT_RATE_API_TIMEOUT,
-                headers={"Accept": "application/json"},
-            )
-        return self._client
+        pass  # No state needed - USDT=USD always
 
     async def close(self) -> None:
-        """Close HTTP client."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-
-    async def get_usdt_usd_rate(self, force_refresh: bool = False) -> CurrencyRate:
-        """
-        Get current USDT/USD conversion rate.
-
-        Args:
-            force_refresh: Force API refresh even if cache valid
-
-        Returns:
-            CurrencyRate with current rate
-        """
-        cache_key = "USDT_USD"
-
-        # Return cached if valid
-        if not force_refresh and cache_key in self._rate_cache:
-            cached = self._rate_cache[cache_key]
-            if not cached.is_expired:
-                return cached
-
-        # Try to fetch from API
-        rate = await self._fetch_usdt_rate()
-
-        if rate is not None:
-            cached_rate = CurrencyRate(
-                rate=rate,
-                source="api",
-                fetched_at=datetime.now(timezone.utc),
-            )
-        else:
-            # Fallback to default
-            cached_rate = CurrencyRate(
-                rate=DEFAULT_USDT_USD_RATE,
-                source="fallback",
-                fetched_at=datetime.now(timezone.utc),
-            )
-
-        self._rate_cache[cache_key] = cached_rate
-        return cached_rate
-
-    async def _fetch_usdt_rate(self) -> Optional[float]:
-        """
-        Fetch USDT/USD rate from CoinGecko API.
-
-        Returns:
-            Rate or None if unavailable
-        """
-        try:
-            client = await self._get_client()
-
-            response = await client.get(
-                COINGECKO_API_URL,
-                params={
-                    "ids": "tether",
-                    "vs_currencies": "usd",
-                },
-            )
-
-            if response.status_code != 200:
-                return None
-
-            data = response.json()
-            rate = data.get("tether", {}).get("usd")
-
-            if rate is not None:
-                return float(rate)
-
-        except Exception as e:
-            print(f"[account-normalizer] Error fetching USDT rate: {e}")
-
-        return None
+        """Close normalizer (no-op, kept for API compatibility)."""
+        pass
 
     def get_conversion_rate(self, currency: str) -> tuple[float, str]:
         """
         Get conversion rate for currency to USD.
 
-        This is the synchronous version that uses cached rates.
-        Call get_usdt_usd_rate() first to populate cache.
+        USDT and USD are both treated as 1:1.
 
         Args:
             currency: Source currency (USD, USDT)
 
         Returns:
-            Tuple of (rate, source) where source is 'identity', 'api', or 'fallback'
+            Tuple of (rate, source) - always (1.0, "identity")
         """
         currency_upper = currency.upper()
 
-        # USD is identity
-        if currency_upper == "USD":
+        # USD and USDT are both identity
+        if currency_upper in ("USD", "USDT"):
             return (1.0, "identity")
-
-        # USDT from cache
-        if currency_upper == "USDT":
-            cached = self._rate_cache.get("USDT_USD")
-            if cached:
-                return (cached.rate, cached.source)
-            # Not in cache, use fallback
-            return (DEFAULT_USDT_USD_RATE, "fallback")
 
         # Unknown currency, assume 1:1
         print(f"[account-normalizer] Unknown currency: {currency}, assuming 1:1 USD")
@@ -252,46 +128,31 @@ class AccountNormalizer:
     async def normalize_balance(
         self,
         balance: Balance,
-        force_refresh_rate: bool = False,
+        force_refresh_rate: bool = False,  # Kept for API compatibility
     ) -> NormalizedBalance:
         """
-        Normalize balance to USD.
+        Normalize balance to USD-equivalent.
 
         Args:
             balance: Original balance from exchange
-            force_refresh_rate: Force rate refresh
+            force_refresh_rate: Ignored (no API calls)
 
         Returns:
-            NormalizedBalance with USD values
+            NormalizedBalance with USD-equivalent values
         """
-        # Pre-fetch USDT rate if needed
-        if balance.currency.upper() == "USDT":
-            await self.get_usdt_usd_rate(force_refresh=force_refresh_rate)
-
-        rate, source = self.get_conversion_rate(balance.currency)
-
-        return NormalizedBalance(
-            original=balance,
-            total_equity_usd=balance.total_equity * rate,
-            available_balance_usd=balance.available_balance * rate,
-            margin_used_usd=balance.margin_used * rate,
-            unrealized_pnl_usd=balance.unrealized_pnl * rate,
-            realized_pnl_today_usd=balance.realized_pnl_today * rate,
-            conversion_rate=rate,
-            conversion_source=source,
-        )
+        return self.normalize_balance_sync(balance)
 
     def normalize_balance_sync(self, balance: Balance) -> NormalizedBalance:
         """
-        Synchronous balance normalization using cached rates.
+        Synchronous balance normalization.
 
-        For async code, prefer normalize_balance() which can refresh rates.
+        USDT is treated as USD (1:1).
 
         Args:
             balance: Original balance from exchange
 
         Returns:
-            NormalizedBalance with USD values
+            NormalizedBalance with USD-equivalent values
         """
         rate, source = self.get_conversion_rate(balance.currency)
 
@@ -310,31 +171,20 @@ class AccountNormalizer:
         self,
         position: Position,
         quote_currency: str = "USD",
-        force_refresh_rate: bool = False,
+        force_refresh_rate: bool = False,  # Kept for API compatibility
     ) -> NormalizedPosition:
         """
-        Normalize position notional value to USD.
+        Normalize position notional value to USD-equivalent.
 
         Args:
             position: Original position from exchange
             quote_currency: Quote currency of the position (USD, USDT)
-            force_refresh_rate: Force rate refresh
+            force_refresh_rate: Ignored (no API calls)
 
         Returns:
-            NormalizedPosition with USD notional
+            NormalizedPosition with USD-equivalent notional
         """
-        # Pre-fetch USDT rate if needed
-        if quote_currency.upper() == "USDT":
-            await self.get_usdt_usd_rate(force_refresh=force_refresh_rate)
-
-        rate, source = self.get_conversion_rate(quote_currency)
-
-        return NormalizedPosition(
-            original=position,
-            notional_value_usd=position.notional_value * rate,
-            conversion_rate=rate,
-            conversion_source=source,
-        )
+        return self.normalize_position_sync(position, quote_currency)
 
     def normalize_position_sync(
         self,
@@ -342,14 +192,16 @@ class AccountNormalizer:
         quote_currency: str = "USD",
     ) -> NormalizedPosition:
         """
-        Synchronous position normalization using cached rates.
+        Synchronous position normalization.
+
+        USDT is treated as USD (1:1).
 
         Args:
             position: Original position from exchange
             quote_currency: Quote currency of the position
 
         Returns:
-            NormalizedPosition with USD notional
+            NormalizedPosition with USD-equivalent notional
         """
         rate, source = self.get_conversion_rate(quote_currency)
 
@@ -361,25 +213,17 @@ class AccountNormalizer:
         )
 
     def clear_cache(self) -> None:
-        """Clear rate cache."""
-        self._rate_cache.clear()
+        """Clear cache (no-op, kept for API compatibility)."""
+        pass
 
     def get_cache_status(self) -> Dict[str, dict]:
         """
         Get cache status for debugging.
 
         Returns:
-            Dict with cache info
+            Empty dict (no caching needed)
         """
-        return {
-            key: {
-                "rate": cached.rate,
-                "source": cached.source,
-                "age_seconds": cached.age_seconds,
-                "is_expired": cached.is_expired,
-            }
-            for key, cached in self._rate_cache.items()
-        }
+        return {}
 
 
 # Global singleton
@@ -396,16 +240,12 @@ def get_account_normalizer() -> AccountNormalizer:
 
 async def init_account_normalizer() -> AccountNormalizer:
     """
-    Initialize the global account normalizer and pre-fetch rates.
+    Initialize the global account normalizer.
 
     Returns:
         Configured AccountNormalizer
     """
     global _account_normalizer
     _account_normalizer = AccountNormalizer()
-
-    # Pre-fetch USDT rate
-    rate = await _account_normalizer.get_usdt_usd_rate()
-    print(f"[account-normalizer] Initialized with USDT/USD={rate.rate:.4f} (source={rate.source})")
-
+    print("[account-normalizer] Initialized (USDT=USD, no API calls)")
     return _account_normalizer

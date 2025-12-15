@@ -107,40 +107,22 @@ class TestAccountStateNormalization:
         assert state["_normalization"]["original_currency"] == "USD"
         assert state["_normalization"]["conversion_rate"] == 1.0
         assert state["_normalization"]["conversion_source"] == "identity"
-        assert state["_normalization"]["is_depeg_warning"] is False
 
     def test_usdt_balance_normalized(self, executor, usdt_balance):
-        """USDT balance normalizes to USD."""
+        """USDT balance treated as 1:1 with USD (no conversion)."""
         positions = []
 
-        # Mock the account normalizer to return a specific rate
-        with patch("app.executor.get_account_normalizer") as mock_normalizer:
-            mock_norm_instance = MagicMock()
-            mock_normalizer.return_value = mock_norm_instance
+        # USDT is treated as USD (1:1), no API calls needed
+        state = executor._to_hl_account_state(usdt_balance, positions)
 
-            # Configure mock to return normalized values
-            mock_norm_balance = MagicMock()
-            mock_norm_balance.total_equity_usd = 49990.0  # 50000 * 0.9998
-            mock_norm_balance.margin_used_usd = 9998.0  # 10000 * 0.9998
-            mock_norm_balance.conversion_rate = 0.9998
-            mock_norm_balance.conversion_source = "api"
-            mock_norm_balance.is_depeg_warning = False
-            mock_norm_instance.normalize_balance_sync.return_value = mock_norm_balance
+        # Values should be unchanged (1:1 rate)
+        assert float(state["marginSummary"]["accountValue"]) == 50000.0
+        assert float(state["marginSummary"]["totalMarginUsed"]) == 10000.0
 
-            mock_norm_pos = MagicMock()
-            mock_norm_pos.notional_value_usd = 0.0
-            mock_norm_instance.normalize_position_sync.return_value = mock_norm_pos
-
-            state = executor._to_hl_account_state(usdt_balance, positions)
-
-            # Values should be USD-normalized
-            assert float(state["marginSummary"]["accountValue"]) == 49990.0
-            assert float(state["marginSummary"]["totalMarginUsed"]) == 9998.0
-
-            # Normalization metadata
-            assert state["_normalization"]["original_currency"] == "USDT"
-            assert state["_normalization"]["conversion_rate"] == 0.9998
-            assert state["_normalization"]["conversion_source"] == "api"
+        # Normalization metadata shows identity (USDT = USD)
+        assert state["_normalization"]["original_currency"] == "USDT"
+        assert state["_normalization"]["conversion_rate"] == 1.0
+        assert state["_normalization"]["conversion_source"] == "identity"
 
     def test_positions_normalized(self, executor, usd_balance, btc_position, eth_position):
         """Position notional values are USD-normalized."""
@@ -171,39 +153,12 @@ class TestAccountStateNormalization:
         total_ntl = float(state["marginSummary"]["totalNtlPos"])
         assert total_ntl == pytest.approx(25500.0, rel=0.01)
 
-    def test_depeg_warning_included(self, executor, usdt_balance):
-        """Depeg warning is included in normalization metadata."""
-        positions = []
-
-        with patch("app.executor.get_account_normalizer") as mock_normalizer:
-            mock_norm_instance = MagicMock()
-            mock_normalizer.return_value = mock_norm_instance
-
-            # Simulate depeg scenario (USDT at $0.98)
-            mock_norm_balance = MagicMock()
-            mock_norm_balance.total_equity_usd = 49000.0
-            mock_norm_balance.margin_used_usd = 9800.0
-            mock_norm_balance.conversion_rate = 0.98  # 2% depeg
-            mock_norm_balance.conversion_source = "api"
-            mock_norm_balance.is_depeg_warning = True  # Triggered
-            mock_norm_instance.normalize_balance_sync.return_value = mock_norm_balance
-
-            mock_norm_pos = MagicMock()
-            mock_norm_pos.notional_value_usd = 0.0
-            mock_norm_instance.normalize_position_sync.return_value = mock_norm_pos
-
-            state = executor._to_hl_account_state(usdt_balance, positions)
-
-            assert state["_normalization"]["is_depeg_warning"] is True
-            assert state["_normalization"]["conversion_rate"] == 0.98
-
-
 class TestMultiExchangeNormalization:
     """Tests for multi-exchange account aggregation."""
 
     def test_mixed_currency_positions(self, executor):
-        """Test handling positions with different quote currencies."""
-        # Bybit balance in USDT
+        """Test handling positions with different quote currencies (USDT=USD)."""
+        # Bybit balance in USDT (treated as 1:1 with USD)
         balance = Balance(
             total_equity=30000.0,
             available_balance=25000.0,
@@ -221,28 +176,18 @@ class TestMultiExchangeNormalization:
             unrealized_pnl=300.0,
         )
 
-        with patch("app.executor.get_account_normalizer") as mock_normalizer:
-            mock_norm_instance = MagicMock()
-            mock_normalizer.return_value = mock_norm_instance
+        state = executor._to_hl_account_state(balance, [position])
 
-            mock_norm_balance = MagicMock()
-            mock_norm_balance.total_equity_usd = 29997.0  # USDT conversion
-            mock_norm_balance.margin_used_usd = 4999.5
-            mock_norm_balance.conversion_rate = 0.9999
-            mock_norm_balance.conversion_source = "api"
-            mock_norm_balance.is_depeg_warning = False
-            mock_norm_instance.normalize_balance_sync.return_value = mock_norm_balance
+        # Verify values unchanged (USDT = USD 1:1)
+        assert float(state["marginSummary"]["accountValue"]) == 30000.0
 
-            # Position: 0.3 * 61000 = 18300 USDT → 18298.17 USD
-            mock_norm_pos = MagicMock()
-            mock_norm_pos.notional_value_usd = 18298.17
-            mock_norm_instance.normalize_position_sync.return_value = mock_norm_pos
+        # Position: 0.3 * 61000 = 18300 (no conversion)
+        assert float(state["marginSummary"]["totalNtlPos"]) == pytest.approx(18300.0, rel=0.01)
 
-            state = executor._to_hl_account_state(balance, [position])
-
-            # Verify USD-normalized values
-            assert float(state["marginSummary"]["accountValue"]) == 29997.0
-            assert float(state["marginSummary"]["totalNtlPos"]) == pytest.approx(18298.17, rel=0.01)
+        # Normalization metadata shows identity
+        assert state["_normalization"]["original_currency"] == "USDT"
+        assert state["_normalization"]["conversion_rate"] == 1.0
+        assert state["_normalization"]["conversion_source"] == "identity"
 
 
 # =============================================================================
@@ -375,63 +320,34 @@ class TestExecutorIntegration:
 
     def test_normalization_metadata_audit_trail(self, executor, usdt_balance):
         """Normalization metadata provides complete audit trail."""
-        with patch("app.executor.get_account_normalizer") as mock_normalizer:
-            mock_norm_instance = MagicMock()
-            mock_normalizer.return_value = mock_norm_instance
+        state = executor._to_hl_account_state(usdt_balance, [])
 
-            mock_norm_balance = MagicMock()
-            mock_norm_balance.total_equity_usd = 49995.0
-            mock_norm_balance.margin_used_usd = 9999.0
-            mock_norm_balance.conversion_rate = 0.9999
-            mock_norm_balance.conversion_source = "api"
-            mock_norm_balance.is_depeg_warning = False
-            mock_norm_instance.normalize_balance_sync.return_value = mock_norm_balance
+        # Complete audit trail (USDT = USD 1:1)
+        norm_meta = state["_normalization"]
+        assert "original_currency" in norm_meta
+        assert "conversion_rate" in norm_meta
+        assert "conversion_source" in norm_meta
 
-            mock_norm_pos = MagicMock()
-            mock_norm_pos.notional_value_usd = 0.0
-            mock_norm_instance.normalize_position_sync.return_value = mock_norm_pos
-
-            state = executor._to_hl_account_state(usdt_balance, [])
-
-            # Complete audit trail
-            norm_meta = state["_normalization"]
-            assert "original_currency" in norm_meta
-            assert "conversion_rate" in norm_meta
-            assert "conversion_source" in norm_meta
-            assert "is_depeg_warning" in norm_meta
-
-            # Source should indicate where rate came from
-            assert norm_meta["conversion_source"] in ["api", "fallback", "identity"]
+        # USDT treated as USD (1:1), source is identity
+        assert norm_meta["original_currency"] == "USDT"
+        assert norm_meta["conversion_rate"] == 1.0
+        assert norm_meta["conversion_source"] == "identity"
 
     def test_risk_check_uses_normalized_values(self, executor, usdt_balance, btc_position):
-        """Risk checks use USD-normalized account values."""
-        with patch("app.executor.get_account_normalizer") as mock_normalizer:
-            mock_norm_instance = MagicMock()
-            mock_normalizer.return_value = mock_norm_instance
+        """Risk checks use USD-normalized account values (USDT=USD)."""
+        state = executor._to_hl_account_state(usdt_balance, [btc_position])
 
-            # Balance: 50000 USDT → 49900 USD (0.998 rate)
-            mock_norm_balance = MagicMock()
-            mock_norm_balance.total_equity_usd = 49900.0
-            mock_norm_balance.margin_used_usd = 9980.0
-            mock_norm_balance.conversion_rate = 0.998
-            mock_norm_balance.conversion_source = "api"
-            mock_norm_balance.is_depeg_warning = False
-            mock_norm_instance.normalize_balance_sync.return_value = mock_norm_balance
+        # Risk governor will use these USD-normalized values (USDT = USD 1:1)
+        account_value = float(state["marginSummary"]["accountValue"])
+        total_exposure = float(state["marginSummary"]["totalNtlPos"])
 
-            # Position: 0.5 BTC * 51000 = 25500 USDT → 25449 USD
-            mock_norm_pos = MagicMock()
-            mock_norm_pos.notional_value_usd = 25449.0
-            mock_norm_instance.normalize_position_sync.return_value = mock_norm_pos
+        # BTC position: 0.5 * 51000 = 25500 (no conversion)
+        assert account_value == 50000.0  # USDT balance unchanged
+        assert total_exposure == pytest.approx(25500.0, rel=0.01)
 
-            state = executor._to_hl_account_state(usdt_balance, [btc_position])
-
-            # Risk governor will use these USD-normalized values
-            account_value = float(state["marginSummary"]["accountValue"])
-            total_exposure = float(state["marginSummary"]["totalNtlPos"])
-
-            # Verify position % calculation uses normalized values
-            position_pct = total_exposure / account_value if account_value > 0 else 0
-            assert position_pct == pytest.approx(25449.0 / 49900.0, rel=0.01)
+        # Verify position % calculation uses normalized values
+        position_pct = total_exposure / account_value if account_value > 0 else 0
+        assert position_pct == pytest.approx(25500.0 / 50000.0, rel=0.01)  # 51%
 
 
 # =============================================================================

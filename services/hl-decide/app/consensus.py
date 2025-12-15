@@ -107,6 +107,7 @@ SLIPPAGE_REFERENCE_SIZE_USD = float(os.getenv("SLIPPAGE_REFERENCE_SIZE_USD", "10
 def get_dynamic_hold_hours_sync(
     asset: str,
     regime: str | None = None,
+    target_exchange: str = "hyperliquid",
 ) -> float:
     """
     Get expected hold time dynamically from cached episode data.
@@ -114,9 +115,13 @@ def get_dynamic_hold_hours_sync(
     Uses HoldTimeEstimator's cache if available, otherwise returns default.
     The cache is populated by async calls during startup.
 
+    Phase 6.4: Applies venue-specific adjustment. For non-HL venues,
+    uses a conservative (shorter) hold time estimate.
+
     Args:
         asset: Asset symbol (BTC, ETH)
         regime: Optional market regime for adjustment (TRENDING, VOLATILE, etc.)
+        target_exchange: Target execution venue (Phase 6.4)
 
     Returns:
         Expected hold time in hours
@@ -127,7 +132,7 @@ def get_dynamic_hold_hours_sync(
     try:
         from .hold_time_estimator import get_hold_time_estimator
         estimator = get_hold_time_estimator()
-        estimate = estimator.get_hold_time_sync(asset, regime)
+        estimate = estimator.get_hold_time_sync(asset, regime, target_exchange)
         return estimate.hours
     except Exception:
         return DEFAULT_HOLD_HOURS
@@ -287,6 +292,18 @@ def get_slippage_estimate_bps_sync(
 
 # Default correlation (used when pairwise not computed)
 DEFAULT_CORRELATION = float(os.getenv("DEFAULT_CORRELATION", "0.3"))
+
+# Conservative default for non-Hyperliquid venues (Phase 6.4)
+# Higher correlation = lower effective-K = more conservative sizing
+# Rationale: HL correlations may not apply to other venues' trader populations
+NON_HL_DEFAULT_CORRELATION = float(os.getenv("NON_HL_DEFAULT_CORRELATION", "0.5"))
+
+# Phase 6.5: Per-signal venue selection configuration
+# Whether to enable per-signal venue selection (compare EV across exchanges)
+PER_SIGNAL_VENUE_SELECTION = os.getenv("PER_SIGNAL_VENUE_SELECTION", "true").lower() == "true"
+
+# Exchanges to compare when selecting best venue (comma-separated)
+VENUE_SELECTION_EXCHANGES = os.getenv("VENUE_SELECTION_EXCHANGES", "hyperliquid,bybit").split(",")
 
 # Weight cap for individual traders (legacy, deprecated)
 WEIGHT_CAP = float(os.getenv("CONSENSUS_WEIGHT_CAP", "1.0"))
@@ -777,11 +794,11 @@ class ConsensusDetector:
         if not passes:
             return None
 
-        # Gate 2: Correlation-adjusted effective-K
+        # Gate 2: Correlation-adjusted effective-K (Phase 6.4: exchange-aware default)
         agreeing_votes = [v for v in votes if v.direction == majority_dir]
         addresses = [v.address for v in agreeing_votes]
         weights = {v.address: v.weight for v in agreeing_votes}
-        eff_k = self.eff_k_from_corr(weights)
+        eff_k = self.eff_k_from_corr(weights, target_exchange=self._target_exchange)
 
         if eff_k < CONSENSUS_MIN_EFFECTIVE_K:
             return None
@@ -805,41 +822,79 @@ class ConsensusDetector:
 
         # Gate 4: EV after costs (using per-exchange fees, funding, slippage)
         p_win = self.calibrated_p_win(agreeing_votes, eff_k)
-        exchange_fees_bps = get_exchange_fees_bps(self._target_exchange)
-
-        # Get funding cost for expected hold time (uses cache or defaults)
-        # Funding is signed: positive = cost, negative = rebate
-        # Hold time is dynamic: uses historical episode data if available (Phase 6.1)
         asset = symbol.split("-")[0] if "-" in symbol else symbol.replace("USDC", "")
-        hold_hours = get_dynamic_hold_hours_sync(asset)
-        funding_cost_bps = get_funding_cost_bps_sync(
-            asset=asset,
-            exchange=self._target_exchange,
-            hold_hours=hold_hours,
-            side=majority_dir,  # Pass position direction for correct funding sign
-        )
 
-        # Get slippage estimate (uses cached orderbook or static defaults)
-        # Use REFERENCE SIZE ($10k) for initial EV gating - this is intentional!
-        # Actual slippage is recalculated in executor with Kelly-sized position.
-        # Using vote notional here would:
-        # 1. Underestimate slippage if Kelly sizes up (e.g., $100k Kelly vs $10k vote)
-        # 2. Overestimate slippage if Kelly sizes down (e.g., $5k Kelly vs $50k vote)
-        # Reference size provides conservative baseline for EV gating decision.
-        slippage_bps = get_slippage_estimate_bps_sync(
-            asset=asset,
-            exchange=self._target_exchange,
-            order_size_usd=SLIPPAGE_REFERENCE_SIZE_USD,
-        )
+        # Phase 6.5: Per-signal venue selection
+        # Compare EV across all configured exchanges and select the best one
+        if PER_SIGNAL_VENUE_SELECTION and len(VENUE_SELECTION_EXCHANGES) > 1:
+            ev_comparison = self.compare_ev_across_exchanges(
+                asset=asset,
+                direction=majority_dir,
+                entry_price=median_entry,
+                stop_price=stop_price,
+                p_win=p_win,
+                exchanges=VENUE_SELECTION_EXCHANGES,
+            )
 
-        ev_result = calculate_ev(
-            p_win=p_win,
-            entry_px=median_entry,
-            stop_px=stop_price,
-            fees_bps=exchange_fees_bps,
-            slip_bps=slippage_bps,
-            funding_bps=funding_cost_bps,
-        )
+            best_exchange = ev_comparison.get("best_exchange", self._target_exchange)
+            best_ev_net_r = ev_comparison.get("best_ev_net_r", 0.0)
+            best_costs = ev_comparison.get(best_exchange, {})
+
+            # Log venue selection decision for audit
+            if best_exchange != self._target_exchange:
+                print(
+                    f"[consensus] Venue selection: {best_exchange} "
+                    f"(EV={best_ev_net_r:.3f}R) over {self._target_exchange} "
+                    f"for {symbol} {majority_dir}"
+                )
+
+            # Use best exchange's EV and costs
+            ev_result = {
+                "ev_gross_r": best_costs.get("ev_gross_r", 0.0),
+                "ev_cost_r": best_costs.get("ev_cost_r", 0.0),
+                "ev_net_r": best_ev_net_r,
+            }
+            selected_exchange = best_exchange
+            selected_fees_bps = best_costs.get("fees_bps", 0.0)
+            selected_slippage_bps = best_costs.get("slippage_bps", 0.0)
+            selected_funding_bps = best_costs.get("funding_bps", 0.0)
+        else:
+            # Single exchange mode (legacy): use global target exchange
+            exchange_fees_bps = get_exchange_fees_bps(self._target_exchange)
+
+            # Get funding cost for expected hold time (uses cache or defaults)
+            # Funding is signed: positive = cost, negative = rebate
+            # Hold time is dynamic: uses historical episode data if available (Phase 6.1)
+            # Phase 6.4: Uses venue-adjusted hold time for non-HL exchanges
+            hold_hours = get_dynamic_hold_hours_sync(asset, target_exchange=self._target_exchange)
+            funding_cost_bps = get_funding_cost_bps_sync(
+                asset=asset,
+                exchange=self._target_exchange,
+                hold_hours=hold_hours,
+                side=majority_dir,  # Pass position direction for correct funding sign
+            )
+
+            # Get slippage estimate (uses cached orderbook or static defaults)
+            # Use REFERENCE SIZE ($10k) for initial EV gating - this is intentional!
+            # Actual slippage is recalculated in executor with Kelly-sized position.
+            slippage_bps = get_slippage_estimate_bps_sync(
+                asset=asset,
+                exchange=self._target_exchange,
+                order_size_usd=SLIPPAGE_REFERENCE_SIZE_USD,
+            )
+
+            ev_result = calculate_ev(
+                p_win=p_win,
+                entry_px=median_entry,
+                stop_px=stop_price,
+                fees_bps=exchange_fees_bps,
+                slip_bps=slippage_bps,
+                funding_bps=funding_cost_bps,
+            )
+            selected_exchange = self._target_exchange
+            selected_fees_bps = exchange_fees_bps
+            selected_slippage_bps = slippage_bps
+            selected_funding_bps = funding_cost_bps
 
         if ev_result["ev_net_r"] < CONSENSUS_EV_MIN_R:
             return None
@@ -853,6 +908,7 @@ class ConsensusDetector:
         # Calculate dispersion (std of vote weights by direction)
         dispersion = self._calculate_dispersion(votes, majority_dir)
 
+        # Phase 6.5: Signal carries selected venue and cost breakdown
         signal = ConsensusSignal(
             id=str(uuid4()),
             symbol=symbol,
@@ -872,6 +928,10 @@ class ConsensusDetector:
             mid_delta_bps=mid_delta_bps,
             created_at=now,
             trigger_addresses=addresses,
+            target_exchange=selected_exchange,
+            fees_bps=selected_fees_bps,
+            slippage_bps=selected_slippage_bps,
+            funding_bps=selected_funding_bps,
         )
 
         # Clear window after generating signal
@@ -947,15 +1007,21 @@ class ConsensusDetector:
         self,
         weights: Dict[str, float],
         fallback_counter_callback: Optional[Callable[[], None]] = None,
+        target_exchange: Optional[str] = None,
     ) -> float:
         """
         Calculate effective K using correlation matrix.
 
         Formula: effK = (Σᵢ wᵢ)² / Σᵢ Σⱼ wᵢ wⱼ ρᵢⱼ
 
+        Phase 6.4: Uses exchange-aware fallback correlation. For non-Hyperliquid
+        venues, we use a more conservative default (higher ρ = lower eff-K)
+        since our correlation data is derived from Hyperliquid traders only.
+
         Args:
             weights: Dict mapping address to weight
             fallback_counter_callback: Optional callback to increment when default ρ is used
+            target_exchange: Target execution venue (default: use self._target_exchange)
 
         Returns:
             Effective number of independent traders
@@ -963,6 +1029,14 @@ class ConsensusDetector:
         addrs = list(weights.keys())
         if len(addrs) <= 1:
             return float(len(addrs))
+
+        # Determine which default correlation to use (Phase 6.4)
+        exchange = (target_exchange or self._target_exchange).lower()
+        if exchange == "hyperliquid":
+            default_rho = DEFAULT_CORRELATION
+        else:
+            # Conservative default for non-HL venues
+            default_rho = NON_HL_DEFAULT_CORRELATION
 
         num = sum(weights.values()) ** 2
         den = 0.0
@@ -976,7 +1050,7 @@ class ConsensusDetector:
                     key = tuple(sorted([a, b]))
                     stored_rho = self.correlation_matrix.get(key)
                     if stored_rho is None:
-                        rho = DEFAULT_CORRELATION
+                        rho = default_rho
                         fallback_count += 1
                     else:
                         rho = stored_rho

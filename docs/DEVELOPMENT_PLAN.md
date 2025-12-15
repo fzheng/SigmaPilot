@@ -26,10 +26,12 @@ A collective intelligence trading system that learns from top Hyperliquid trader
 | 6.1 | Multi-Exchange Refinements | ✅ Complete |
 | 6.2 | Native Stop Orders (Execution Resilience) | ✅ Complete |
 | 6.3 | Per-Venue EV Routing | ✅ Complete |
+| 6.4 | Per-Venue Data-Quality Fallbacks | ✅ Complete |
+| 6.5 | Per-Signal Venue Selection | ✅ Complete |
 
 ---
 
-## Current State: Phase 6.3 Complete
+## Current State: Phase 6.5 Complete
 
 ### What's Working
 
@@ -74,7 +76,7 @@ Leaderboard → Quality Filter → Alpha Pool → Thompson Sampling → Consensu
 
 **Test Coverage:**
 - TypeScript: 1,035 unit tests (28 test suites)
-- Python: 718 tests (hl-sage + hl-decide including Kelly, regime, exchange adapters, ATR/fee/funding/slippage/normalizer/executor/hold-time providers, native stops)
+- Python: 779 tests (hl-sage + hl-decide including Kelly, regime, exchange adapters, ATR/fee/funding/slippage/normalizer/executor/hold-time providers, native stops, per-signal venue selection)
 - E2E: 220 Playwright tests (6 spec files)
 
 ### Phase 3c Additions (December 2025)
@@ -910,21 +912,17 @@ Address remaining gaps in multi-exchange support for production-quality executio
 - `tests/test_slippage_provider.py` - 30 unit tests
 
 #### 6.1.5 Account State Normalization ✅
-- [x] Normalize all equity to USD (Bybit USDT → USD conversion)
-- [x] USDT/USD rate fetching with caching (CoinGecko API, 60s TTL)
-- [x] Static fallback rate (1.0) when API unavailable
-- [x] Depeg warning detection (>0.5% deviation from $1.00)
+- [x] Normalize all equity to USD (USDT treated as 1:1 with USD)
 - [x] `NormalizedBalance` dataclass for USD-normalized values
 - [x] `NormalizedPosition` dataclass for USD-normalized notional
 - [x] Sync and async normalization methods
-- [x] Integration with main.py startup (pre-fetch USDT rate)
-- [x] 33 unit tests for account normalizer
+- [x] 20 unit tests for account normalizer
 
-**Why**: Risk sizing and exposure caps can be wrong on non-HL venues until equity is normalized. Bybit reports USDT (stablecoin), HL reports USD (mark-to-market).
+**Why**: Provides consistent interface for multi-exchange equity aggregation. USDT is a stablecoin pegged 1:1 to USD - tracking tiny depegs adds complexity without meaningful value for position sizing or risk calculations.
 
 **Key Files:**
-- `app/account_normalizer.py` - Account state normalizer with USDT/USD conversion
-- `tests/test_account_normalizer.py` - 33 unit tests
+- `app/account_normalizer.py` - Account state normalizer (USDT = USD, no API calls)
+- `tests/test_account_normalizer.py` - 20 unit tests
 
 **Usage:**
 ```python
@@ -932,8 +930,8 @@ from app.account_normalizer import get_account_normalizer
 
 normalizer = get_account_normalizer()
 bybit_balance = await bybit.get_balance()  # currency="USDT"
-normalized = await normalizer.normalize_balance(bybit_balance)
-print(f"Equity: ${normalized.total_equity_usd:.2f}")  # Now in USD
+normalized = normalizer.normalize_balance_sync(bybit_balance)
+print(f"Equity: ${normalized.total_equity_usd:.2f}")  # USDT treated as USD
 ```
 
 ### Known Gaps (from Quant Review)
@@ -993,9 +991,9 @@ The following gaps have been identified through quant review and need to be addr
 
 #### Gap 5: Account Normalization Usage ✅ (Resolved)
 **Issue**: Account normalizer exists but risk/exposure/sizing paths may not consume normalized equity.
-**Fix Applied**: Executor `_to_hl_account_state()` now uses `get_account_normalizer().normalize_balance_sync()` to convert all values to USD before passing to risk governor. USDT → USD conversion happens automatically for Bybit positions.
+**Fix Applied**: Executor `_to_hl_account_state()` now uses `get_account_normalizer().normalize_balance_sync()` to normalize all values before passing to risk governor. USDT is treated as 1:1 with USD (no API calls needed).
 - `accountValue`, `totalMarginUsed`, `totalNtlPos` are all USD-normalized
-- `_normalization` metadata included for audit trail (original_currency, conversion_rate, is_depeg_warning)
+- `_normalization` metadata included for audit trail (original_currency, conversion_rate)
 
 ### Pre-Live Validation Checklist
 
@@ -1016,7 +1014,7 @@ Before enabling live trading on any venue, validate:
 | Dynamic fees | Fees refresh with TTL caching | ✅ 20 tests |
 | Funding in EV | Hold cost affects signal selection | ✅ 26 tests |
 | Slippage estimation | Large orders get slippage warning | ✅ 30 tests |
-| Account normalization | USDT/USD equity consistent | ✅ 33 tests |
+| Account normalization | USDT=USD (1:1) equity consistent | ✅ 20 tests |
 | Normalization wired | Risk paths use normalized equity | ✅ 22 tests |
 | Slippage re-calc | Executor uses Kelly-sized position | ✅ 6 tests |
 | Dynamic hold-time | Funding uses historical episode data | ✅ 26 tests |
@@ -1273,6 +1271,192 @@ ALTER TABLE consensus_signals
 
 ---
 
+## Phase 6.4: Per-Venue Data-Quality Fallbacks ✅
+
+### Goal
+Address the gap that correlation and hold-time data is derived exclusively from Hyperliquid.
+When executing on non-HL venues, use more conservative defaults to account for uncertainty.
+
+### Key Problem
+- Our pairwise correlation matrix is built from HL fills only
+- Hold-time statistics come from HL episode data
+- When routing to Bybit/Aster, these HL-derived metrics may not apply
+- Using HL-optimistic defaults on non-HL venues can over-estimate effective-K and under-estimate costs
+
+### Solution: Conservative Fallbacks
+
+**Per-Exchange Correlation Default:**
+```python
+# consensus.py / correlation.py
+DEFAULT_CORRELATION = 0.3           # Used for Hyperliquid
+NON_HL_DEFAULT_CORRELATION = 0.5    # Used for Bybit, Aster, etc.
+
+# In eff_k_from_corr():
+if target_exchange == "hyperliquid":
+    default_rho = 0.3   # Trust HL data
+else:
+    default_rho = 0.5   # Conservative: assume more correlation
+```
+
+**Impact on Effective-K:**
+- Higher ρ → lower effective-K → fewer "independent" votes → more conservative sizing
+- Example: 4 traders with ρ=0.3 → eff-K ≈ 2.1
+- Example: 4 traders with ρ=0.5 → eff-K ≈ 1.6
+
+**Per-Venue Hold-Time Adjustment:**
+```python
+# hold_time_estimator.py
+VENUE_HOLD_TIME_MULTIPLIERS = {
+    "hyperliquid": 1.0,   # Baseline (data source)
+    "bybit": 0.85,        # Conservative: -15%
+    "aster": 0.85,        # Conservative: -15%
+}
+```
+
+**Impact on Funding Costs:**
+- Shorter hold-time → fewer 8h funding periods → lower absolute funding cost assumed
+- This is conservative because it doesn't assume funding will offset costs
+
+**Per-Venue Rate Limiting:**
+```python
+# exchanges/manager.py
+EXCHANGE_RATE_LIMIT_DELAYS_MS = {
+    "hyperliquid": 300,   # HL is relatively lenient
+    "aster": 500,         # Similar to HL
+    "bybit": 750,         # Stricter limits (10 req/s public)
+}
+```
+
+### Files Changed
+| File | Changes |
+|------|---------|
+| `consensus.py` | Added `NON_HL_DEFAULT_CORRELATION`, updated `eff_k_from_corr()` |
+| `correlation.py` | Added `NON_HL_DEFAULT_CORRELATION`, updated `get_with_decay()`, `hydrate_detector()` |
+| `hold_time_estimator.py` | Added `VENUE_HOLD_TIME_MULTIPLIERS`, updated `get_hold_time()`, `get_hold_time_sync()` |
+| `exchanges/manager.py` | Added `EXCHANGE_RATE_LIMIT_DELAYS_MS`, updated `health_check()` |
+
+### Acceptance Criteria
+
+| Requirement | Implementation | Status |
+|-------------|----------------|--------|
+| HL uses ρ=0.3 default | `target_exchange=hyperliquid` uses 0.3 | ✅ |
+| Non-HL uses ρ=0.5 default | `target_exchange=bybit` uses 0.5 | ✅ |
+| Higher ρ → lower eff-K | Conservative sizing for non-HL | ✅ |
+| Hold-time venue adjustment | 0.85x multiplier for non-HL | ✅ |
+| Per-venue rate limits | Bybit 750ms, HL 300ms delays | ✅ |
+| All tests passing | 21 Phase 6.4 tests passing | ✅ |
+
+---
+
+## Phase 6.5: Per-Signal Venue Selection ✅
+
+### Goal
+For each consensus signal, dynamically select the best execution venue by comparing
+net expected value (EV) across all available exchanges. This addresses the gap where
+signals were routed to a single global `_target_exchange` regardless of venue-specific
+cost differences.
+
+### Status: Complete (December 2025)
+
+### Why This Matters
+
+The current implementation has a limitation:
+- `ConsensusDetector._target_exchange` is set globally at startup
+- All signals use the same venue's fees/slippage/funding in EV calculation
+- Cannot identify when a different venue offers better net EV
+
+**Example**: A BTC long signal might have:
+- Hyperliquid: +0.32R net EV (lower slippage, higher funding cost)
+- Bybit: +0.38R net EV (slightly higher fees, but negative funding = rebate)
+
+Without per-signal venue selection, we'd execute on HL and leave 0.06R on the table.
+
+### Solution: Per-Signal EV Comparison
+
+```python
+# In check_consensus(), after EV gate passes:
+ev_comparison = self.compare_ev_across_exchanges(
+    asset=asset,
+    direction=majority_dir,
+    entry_price=median_entry,
+    stop_price=stop_price,
+    p_win=p_win,
+    exchanges=["hyperliquid", "bybit"],
+)
+
+best_exchange = ev_comparison.get("best_exchange", "hyperliquid")
+best_costs = ev_comparison.get(best_exchange, {})
+
+# Populate signal with selected venue and cost breakdown
+signal = ConsensusSignal(
+    ...
+    target_exchange=best_exchange,
+    fees_bps=best_costs.get("fees_bps", 0),
+    slippage_bps=best_costs.get("slippage_bps", 0),
+    funding_bps=best_costs.get("funding_bps", 0),
+)
+```
+
+### Implementation Tasks
+
+#### 6.5.1 Consensus Signal Field Population ✅
+- [x] Add `target_exchange` field to `ConsensusSignal` (exists from Phase 6.3)
+- [x] Add `fees_bps`, `slippage_bps`, `funding_bps` fields (exists from Phase 6.3)
+- [x] Populate fields in `check_consensus()` from best exchange result
+
+#### 6.5.2 Multi-Venue EV Comparison in Gate ✅
+- [x] Call `compare_ev_across_exchanges()` in `check_consensus()`
+- [x] Select best venue by highest net EV
+- [x] Log venue selection decision for audit
+
+#### 6.5.3 Executor Venue Routing ✅
+- [x] Pass `signal.target_exchange` to `maybe_execute_signal()`
+- [x] Executor uses signal's venue instead of global config
+- [x] Execution logs include selected venue
+
+#### 6.5.4 Database Persistence ✅
+- [x] Migration 033 adds venue/cost columns to `consensus_signals` (from Phase 6.3)
+- [x] Verify columns persist correctly on signal insert
+
+#### 6.5.5 Unit Tests ✅
+- [x] Test venue selection picks highest EV
+- [x] Test fallback when venue unavailable
+- [x] Test signal carries correct cost breakdown
+- [x] Test executor uses signal's venue
+- [x] 18 tests covering all Phase 6.5 features
+
+### Configuration
+
+```bash
+# Available exchanges for venue comparison
+VENUE_SELECTION_EXCHANGES=hyperliquid,bybit
+
+# Whether to enable per-signal venue selection (default: true)
+PER_SIGNAL_VENUE_SELECTION=true
+```
+
+### Key Files
+
+| File | Description |
+|------|-------------|
+| `app/consensus.py` | Per-signal venue selection in `check_consensus()` |
+| `app/main.py` | Consensus gate wiring |
+| `app/executor.py` | Venue routing from signal |
+| `tests/test_phase_6_5.py` | Unit tests |
+
+### Acceptance Criteria
+
+| Requirement | Implementation | Status |
+|-------------|----------------|--------|
+| Per-signal EV comparison | Call `compare_ev_across_exchanges()` in gate | ✅ |
+| Best venue selection | Max net EV wins | ✅ |
+| Signal carries venue | `target_exchange` populated | ✅ |
+| Cost breakdown in signal | fees/slippage/funding fields | ✅ |
+| Executor routes to venue | Uses `signal.target_exchange` | ✅ |
+| All tests passing | 18 Phase 6.5 tests + 779 Python + 1035 TS | ✅ |
+
+---
+
 ## Architecture
 
 ```
@@ -1349,6 +1533,7 @@ ATR_MAX_STALENESS_SECONDS=300
 CORR_DECAY_HALFLIFE_DAYS=3.0
 CORR_REFRESH_INTERVAL_HOURS=24
 DEFAULT_CORRELATION=0.3
+NON_HL_DEFAULT_CORRELATION=0.5    # Phase 6.4: conservative for non-HL venues
 
 # Vote Weighting
 VOTE_WEIGHT_MODE=log              # log, equity, or linear
@@ -1435,4 +1620,4 @@ docker compose logs -f hl-decide
 
 ---
 
-*Last updated: December 14, 2025 (Phase 6.3 complete: Per-venue EV routing - 26 new tests; consensus compares EV across exchanges; signals route to best venue; cost breakdown tracked in ConsensusSignal)*
+*Last updated: December 14, 2025 (Phase 6.5 complete: Per-signal venue selection - 18 new tests; consensus now calculates venue-specific EV and routes signals to the exchange with highest net expected value)*

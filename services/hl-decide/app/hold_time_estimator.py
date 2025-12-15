@@ -38,6 +38,15 @@ REGIME_HOLD_TIME_MULTIPLIERS = {
     "UNKNOWN": 1.0,     # Default
 }
 
+# Per-venue hold time multipliers (Phase 6.4)
+# Since our episode data is HL-only, apply conservative estimate for other venues
+# Lower multiplier = shorter expected hold = more conservative funding cost assumption
+VENUE_HOLD_TIME_MULTIPLIERS = {
+    "hyperliquid": 1.0,  # Baseline (data source)
+    "bybit": 0.85,       # Conservative: -15%
+    "aster": 0.85,       # Conservative: -15%
+}
+
 
 class EstimateSource(Enum):
     """Source of hold time estimate."""
@@ -56,6 +65,7 @@ class HoldTimeEstimate:
     std_hours: Optional[float] = None  # Standard deviation
     regime: Optional[str] = None  # Regime used for adjustment
     asset: str = ""
+    target_exchange: str = "hyperliquid"  # Venue for adjustment (Phase 6.4)
 
 
 @dataclass
@@ -90,36 +100,74 @@ class HoldTimeEstimator:
         asset: str,
         db: asyncpg.Pool,
         regime: Optional[str] = None,
+        target_exchange: str = "hyperliquid",
         force_refresh: bool = False,
     ) -> HoldTimeEstimate:
         """
         Get expected hold time for an asset.
 
+        Phase 6.4: Applies venue-specific adjustment. Since episode data is
+        HL-sourced, non-HL venues use a conservative (shorter) estimate.
+
         Args:
             asset: Asset symbol (BTC, ETH)
             db: Database pool
             regime: Optional market regime for adjustment
+            target_exchange: Target venue for adjustment (Phase 6.4)
             force_refresh: Bypass cache
 
         Returns:
             HoldTimeEstimate with expected hold hours
         """
+        # Cache key includes regime but not exchange (apply exchange multiplier on read)
         cache_key = f"{asset.upper()}:{regime or 'none'}"
 
         # Check cache
         if not force_refresh and cache_key in self._cache:
             cached = self._cache[cache_key]
             if not cached.is_expired:
-                return cached.estimate
+                # Apply venue multiplier (Phase 6.4)
+                base_estimate = cached.estimate
+                venue_multiplier = VENUE_HOLD_TIME_MULTIPLIERS.get(
+                    target_exchange.lower(), 0.85
+                )
+                if venue_multiplier != 1.0:
+                    return HoldTimeEstimate(
+                        hours=base_estimate.hours * venue_multiplier,
+                        source=base_estimate.source,
+                        episode_count=base_estimate.episode_count,
+                        median_hours=base_estimate.median_hours,
+                        std_hours=base_estimate.std_hours,
+                        regime=base_estimate.regime,
+                        asset=base_estimate.asset,
+                        target_exchange=target_exchange.lower(),
+                    )
+                return base_estimate
 
         # Fetch from database
         estimate = await self._compute_estimate(asset, db, regime)
 
-        # Update cache
+        # Update cache (base estimate without venue adjustment)
         self._cache[cache_key] = CachedHoldTime(
             estimate=estimate,
             fetched_at=datetime.now(timezone.utc),
         )
+
+        # Apply venue multiplier (Phase 6.4)
+        venue_multiplier = VENUE_HOLD_TIME_MULTIPLIERS.get(
+            target_exchange.lower(), 0.85
+        )
+        if venue_multiplier != 1.0:
+            return HoldTimeEstimate(
+                hours=estimate.hours * venue_multiplier,
+                source=estimate.source,
+                episode_count=estimate.episode_count,
+                median_hours=estimate.median_hours,
+                std_hours=estimate.std_hours,
+                regime=estimate.regime,
+                asset=estimate.asset,
+                target_exchange=target_exchange.lower(),
+            )
 
         return estimate
 
@@ -219,48 +267,77 @@ class HoldTimeEstimator:
         self,
         asset: str,
         regime: Optional[str] = None,
+        target_exchange: str = "hyperliquid",
     ) -> HoldTimeEstimate:
         """
         Synchronous hold time lookup using cached data.
 
+        Phase 6.4: Applies venue-specific adjustment for non-HL exchanges.
         For async code, prefer get_hold_time() which can refresh from DB.
 
         Args:
             asset: Asset symbol (BTC, ETH)
             regime: Optional regime for adjustment
+            target_exchange: Target venue for adjustment (Phase 6.4)
 
         Returns:
             Cached estimate or fallback
         """
         cache_key = f"{asset.upper()}:{regime or 'none'}"
 
+        # Venue multiplier (Phase 6.4)
+        venue_multiplier = VENUE_HOLD_TIME_MULTIPLIERS.get(
+            target_exchange.lower(), 0.85
+        )
+
         if cache_key in self._cache and not self._cache[cache_key].is_expired:
-            return self._cache[cache_key].estimate
+            base_estimate = self._cache[cache_key].estimate
+            if venue_multiplier != 1.0:
+                return HoldTimeEstimate(
+                    hours=base_estimate.hours * venue_multiplier,
+                    source=base_estimate.source,
+                    episode_count=base_estimate.episode_count,
+                    median_hours=base_estimate.median_hours,
+                    std_hours=base_estimate.std_hours,
+                    regime=base_estimate.regime,
+                    asset=base_estimate.asset,
+                    target_exchange=target_exchange.lower(),
+                )
+            return base_estimate
 
         # Check without regime
         base_key = f"{asset.upper()}:none"
         if base_key in self._cache and not self._cache[base_key].is_expired:
             base_estimate = self._cache[base_key].estimate
-            if regime:
-                multiplier = REGIME_HOLD_TIME_MULTIPLIERS.get(regime.upper(), 1.0)
-                return HoldTimeEstimate(
-                    hours=base_estimate.hours * multiplier,
-                    source=EstimateSource.REGIME_ADJUSTED,
-                    episode_count=base_estimate.episode_count,
-                    median_hours=base_estimate.median_hours,
-                    std_hours=base_estimate.std_hours,
-                    asset=asset.upper(),
-                    regime=regime,
-                )
-            return base_estimate
+            hours = base_estimate.hours
 
-        # Fallback
+            # Apply regime multiplier if needed
+            if regime:
+                regime_multiplier = REGIME_HOLD_TIME_MULTIPLIERS.get(regime.upper(), 1.0)
+                hours *= regime_multiplier
+
+            # Apply venue multiplier
+            hours *= venue_multiplier
+
+            return HoldTimeEstimate(
+                hours=hours,
+                source=EstimateSource.REGIME_ADJUSTED if regime else base_estimate.source,
+                episode_count=base_estimate.episode_count,
+                median_hours=base_estimate.median_hours,
+                std_hours=base_estimate.std_hours,
+                asset=asset.upper(),
+                regime=regime,
+                target_exchange=target_exchange.lower(),
+            )
+
+        # Fallback (apply venue multiplier)
         return HoldTimeEstimate(
-            hours=DEFAULT_HOLD_HOURS,
+            hours=DEFAULT_HOLD_HOURS * venue_multiplier,
             source=EstimateSource.FALLBACK,
             episode_count=0,
             asset=asset.upper(),
             regime=regime,
+            target_exchange=target_exchange.lower(),
         )
 
     async def get_asset_summary(

@@ -206,7 +206,7 @@ class HyperliquidExecutor:
         This enables backward compatibility with existing risk checks.
         All values are normalized to USD using AccountNormalizer (Phase 6.1.5).
         """
-        # Normalize balance to USD (handles USDT → USD conversion for Bybit)
+        # Normalize balance to USD (USDT treated as 1:1 with USD)
         normalizer = get_account_normalizer()
         normalized = normalizer.normalize_balance_sync(balance)
 
@@ -242,7 +242,6 @@ class HyperliquidExecutor:
                 "original_currency": balance.currency,
                 "conversion_rate": normalized.conversion_rate,
                 "conversion_source": normalized.conversion_source,
-                "is_depeg_warning": normalized.is_depeg_warning,
             },
         }
 
